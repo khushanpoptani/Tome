@@ -42,6 +42,22 @@ pnpm build:server      # build the server for the current host
 
 Run `pnpm format` to apply repository formatting.
 
+## Running the Phase 1 server
+
+The default configuration is intentionally loopback-only:
+
+```sh
+cargo run -p tome-server
+```
+
+To listen on a private LAN interface, choose the interface address explicitly rather than using a wildcard:
+
+```sh
+TOME_NETWORK_MODE=lan TOME_BIND_ADDRESS=192.168.1.20 cargo run -p tome-server
+```
+
+For Tailscale, use the machine's `100.64.0.0/10` address (or Tailscale IPv6 address) and set `TOME_NETWORK_MODE=tailscale`. See [Phase 1 server and jobs](phase-1-server.md) for all configuration, safety constraints, and API details.
+
 ## Distribution builds
 
 Build the Apple Silicon DMG on macOS:

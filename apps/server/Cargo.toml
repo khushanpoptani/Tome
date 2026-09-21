@@ -5,5 +5,25 @@ edition.workspace = true
 rust-version.workspace = true
 publish = false
 
+[dependencies]
+axum = { version = "0.8.4", features = ["ws"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.143"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite"] }
+thiserror = "2.0.16"
+time = { version = "0.3.43", features = ["formatting"] }
+tokio = { version = "1.47.1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.16", features = ["rt"] }
+tower-http = { version = "0.6.6", features = ["cors"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
+uuid = { version = "1.18.1", features = ["v7"] }
+
+[dev-dependencies]
+futures-util = "0.3.31"
+tempfile = "3.21.0"
+tokio-tungstenite = "0.29.0"
+tower = { version = "0.5.2", features = ["util"] }
+
 [lints]
 workspace = true
