@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  web-quality:
+    name: Web quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm format:check:web
+      - run: pnpm lint:web
+      - run: pnpm test:web
+      - run: pnpm typecheck:web
+      - run: pnpm build:web
+
+  server-windows:
+    name: Windows server
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy
+          rustup default 1.97.1
+          rustup target add x86_64-pc-windows-msvc
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked -p tome-server --all-targets -- -D warnings
+      - run: cargo test --locked -p tome-server
+      - run: cargo build --locked --release -p tome-server --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: tome-server-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/tome-server.exe
+          if-no-files-found: error
+
+  client-macos:
+    name: macOS client
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: pnpm/action-setup@v6.1.0
+        with:
+          version: 12.5.1
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy --target aarch64-apple-darwin
+          rustup default 1.97.1
+      - run: pnpm install --frozen-lockfile
+      - run: cargo clippy --locked -p tome-client --all-targets --target aarch64-apple-darwin -- -D warnings
+      - run: cargo test --locked -p tome-client --target aarch64-apple-darwin
+      - run: pnpm build:client
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: tome-client-macos-apple-silicon
+          path: target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          if-no-files-found: error

@@ -1,0 +1,30 @@
+{
+  "name": "tome",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=24.21.0 <27",
+    "pnpm": "12.5.1"
+  },
+  "packageManager": "pnpm@12.5.1",
+  "scripts": {
+    "build:client": "pnpm --filter @tome/client build:dmg",
+    "build:server": "cargo build --locked --release -p tome-server",
+    "build:server:windows": "cargo build --locked --release -p tome-server --target x86_64-pc-windows-msvc",
+    "build:web": "pnpm --filter @tome/client build:web",
+    "check": "pnpm format:check && pnpm lint && pnpm test && pnpm typecheck:web",
+    "dev:client": "pnpm --filter @tome/client tauri dev",
+    "format": "pnpm format:web && cargo fmt --all",
+    "format:check": "pnpm format:check:web && cargo fmt --all -- --check",
+    "format:check:web": "prettier --check .",
+    "format:web": "prettier --write .",
+    "lint": "pnpm lint:web && cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "lint:web": "pnpm --filter @tome/client lint",
+    "test": "pnpm test:web && cargo test --workspace --locked",
+    "test:web": "pnpm --filter @tome/client test",
+    "typecheck:web": "pnpm --filter @tome/client typecheck"
+  },
+  "devDependencies": {
+    "prettier": "3.9.8"
+  }
+}
