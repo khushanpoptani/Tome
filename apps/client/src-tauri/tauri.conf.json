@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Tome",
+  "version": "0.1.0",
+  "identifier": "com.khushanpoptani.tome",
+  "build": {
+    "beforeDevCommand": "pnpm dev:web",
+    "beforeBuildCommand": "pnpm build:web",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Tome",
+        "width": 1000,
+        "height": 700,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["dmg"],
+    "icon": ["icons/icon.icns", "icons/icon.png"]
+  }
+}

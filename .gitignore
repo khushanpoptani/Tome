@@ -6,9 +6,11 @@
 # JavaScript
 node_modules/
 dist/
+*.tsbuildinfo
 
 # Rust
 target/
+apps/client/src-tauri/gen/
 
 # Editors
 .idea/

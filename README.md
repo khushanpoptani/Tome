@@ -1,5 +1,9 @@
 # Tome
 
-Tome is a desktop client and self-hosted server for local AI conversations.
+Tome is a macOS desktop client and a self-hosted Windows server for local AI conversations.
 
-The project is in development. See `docs/development.md` for setup instructions once the Stage 0 development environment is approved and merged.
+This repository currently contains the Stage 0 development foundation only. Product functionality will be implemented in later, separately reviewed stages.
+
+- [Development setup](docs/development.md)
+- [Architecture decisions](docs/architecture.md)
+- [Contributing](CONTRIBUTING.md)
