@@ -39,8 +39,9 @@ $tailscaleFilter = $tailscaleRule | Get-NetFirewallAddressFilter
 if ($lanFilter.RemoteAddress -notcontains 'LocalSubnet') {
   throw 'LAN firewall rule is not scoped to LocalSubnet.'
 }
-if ($tailscaleFilter.RemoteAddress -notcontains '100.64.0.0/10') {
-  throw 'Tailscale firewall rule is not scoped to 100.64.0.0/10.'
+$tailscaleAddresses = @($tailscaleFilter.RemoteAddress)
+if ($tailscaleAddresses -notcontains '100.64.0.0-100.127.255.255') {
+  throw "Tailscale firewall rule is not scoped to the CGNAT range. Found: $($tailscaleAddresses -join ', ')"
 }
 
 $appData = Join-Path $env:LOCALAPPDATA 'com.khushanpoptani.tome-server'

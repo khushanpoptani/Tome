@@ -31,6 +31,8 @@ const MAX_LOGS: usize = 100;
 const LAN_RULE: &str = "Tome Server (Private LAN)";
 #[cfg(windows)]
 const TAILSCALE_RULE: &str = "Tome Server (Tailscale)";
+#[cfg(windows)]
+const TAILSCALE_REMOTE_RANGE: &str = "100.64.0.0-100.127.255.255";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -485,7 +487,7 @@ fn set_firewall_rules(enabled: bool, port: u16) -> Result<(), String> {
     );
     let script = if enabled {
         format!(
-            "{remove} netsh advfirewall firewall add rule name=\"{LAN_RULE}\" dir=in action=allow protocol=TCP localport={port} program=\"{}\" profile=private remoteip=LocalSubnet enable=yes; netsh advfirewall firewall add rule name=\"{TAILSCALE_RULE}\" dir=in action=allow protocol=TCP localport={port} program=\"{}\" profile=any remoteip=100.64.0.0/10 enable=yes",
+            "{remove} netsh advfirewall firewall add rule name=\"{LAN_RULE}\" dir=in action=allow protocol=TCP localport={port} program=\"{}\" profile=private remoteip=LocalSubnet enable=yes; netsh advfirewall firewall add rule name=\"{TAILSCALE_RULE}\" dir=in action=allow protocol=TCP localport={port} program=\"{}\" profile=any remoteip={TAILSCALE_REMOTE_RANGE} enable=yes",
             executable.display(),
             executable.display()
         )

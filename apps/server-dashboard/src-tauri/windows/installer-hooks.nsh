@@ -7,7 +7,7 @@
 !macro NSIS_HOOK_POSTINSTALL
   DetailPrint "Adding restricted Tome Server firewall rules for TCP 7331"
   nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Tome Server (Private LAN)" dir=in action=allow protocol=TCP localport=7331 program="$INSTDIR\${MAINBINARYNAME}.exe" profile=private remoteip=LocalSubnet enable=yes'
-  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Tome Server (Tailscale)" dir=in action=allow protocol=TCP localport=7331 program="$INSTDIR\${MAINBINARYNAME}.exe" profile=any remoteip=100.64.0.0/10 enable=yes'
+  nsExec::ExecToLog 'netsh advfirewall firewall add rule name="Tome Server (Tailscale)" dir=in action=allow protocol=TCP localport=7331 program="$INSTDIR\${MAINBINARYNAME}.exe" profile=any remoteip=100.64.0.0-100.127.255.255 enable=yes'
   ${IfNot} ${Silent}
     ExecShell "open" "$INSTDIR\${MAINBINARYNAME}.exe"
   ${EndIf}
