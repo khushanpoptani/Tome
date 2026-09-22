@@ -3,10 +3,16 @@ import { formatBytes, loadModelSnapshot } from './model-management';
 import type { ConnectionProfile } from './connection';
 
 const profile: ConnectionProfile = {
+  id: '0199a0ce-491b-7cc4-bbb7-9279f9067241',
   name: 'Server',
   mode: 'lan',
   host: '192.168.1.2',
   port: 7331,
+  createdAt: '2026-09-22T00:00:00.000Z',
+  updatedAt: '2026-09-22T00:00:00.000Z',
+  lastConnectedAt: null,
+  lastEventId: 0,
+  compatibility: null,
 };
 
 afterEach(() => vi.unstubAllGlobals());

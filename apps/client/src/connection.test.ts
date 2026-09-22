@@ -3,18 +3,22 @@ import {
   CLIENT_PROTOCOL_VERSION,
   connectToServer,
   isProtocolCompatible,
-  loadProfile,
-  saveProfile,
   serverBaseUrl,
   type ConnectionProfile,
   type ConnectionState,
 } from './connection';
 
 const profile: ConnectionProfile = {
+  id: '0199a0ce-491b-7cc4-bbb7-9279f9067241',
   name: 'Studio PC',
   mode: 'lan',
   host: '192.168.1.20',
   port: 7331,
+  createdAt: '2026-09-22T00:00:00.000Z',
+  updatedAt: '2026-09-22T00:00:00.000Z',
+  lastConnectedAt: null,
+  lastEventId: 0,
+  compatibility: null,
 };
 
 function capabilities(minimum = 1, maximum = 1) {
@@ -38,22 +42,6 @@ describe('connection foundation', () => {
     expect(serverBaseUrl({ ...profile, host: 'fd7a:115c:a1e0::1' })).toBe(
       'http://[fd7a:115c:a1e0::1]:7331',
     );
-  });
-
-  it('persists one deliberately minimal Phase 1 profile', () => {
-    const values = new Map<string, string>();
-    const storage: Storage = {
-      get length() {
-        return values.size;
-      },
-      clear: () => values.clear(),
-      getItem: (key: string) => values.get(key) ?? null,
-      key: (index: number) => [...values.keys()][index] ?? null,
-      removeItem: (key: string) => void values.delete(key),
-      setItem: (key: string, value: string) => void values.set(key, value),
-    };
-    saveProfile(profile, storage);
-    expect(loadProfile(storage)).toEqual(profile);
   });
 
   it('checks the supported protocol range', () => {
@@ -115,9 +103,14 @@ describe('connection foundation', () => {
         ),
     });
     expect(result).toEqual({
-      status: 'error',
+      status: 'incompatible',
       message:
         'Protocol mismatch: this client supports 1, but the server accepts 2–2.',
     });
+  });
+
+  it('rejects public numeric endpoints before connecting', async () => {
+    const result = await connectToServer({ ...profile, host: '8.8.8.8' });
+    expect(result.status).toBe('error');
   });
 });
