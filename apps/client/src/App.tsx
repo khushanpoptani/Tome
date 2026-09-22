@@ -1,9 +1,12 @@
 import {
+  Component,
   useCallback,
   useEffect,
   useMemo,
   useState,
+  type ErrorInfo,
   type FormEvent,
+  type ReactNode,
 } from 'react';
 import {
   connectToServer,
@@ -175,10 +178,38 @@ export function App() {
         </footer>
       </section>
       {connection.status === 'connected' && (
-        <ModelManagement profile={profile} />
+        <ModelErrorBoundary key={`${profile.host}:${profile.port}`}>
+          <ModelManagement profile={profile} />
+        </ModelErrorBoundary>
       )}
     </main>
   );
+}
+
+class ModelErrorBoundary extends Component<
+  { children: ReactNode },
+  { error: string }
+> {
+  state = { error: '' };
+
+  static getDerivedStateFromError(error: unknown) {
+    return { error: String(error) };
+  }
+
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error('Tome model workspace failed to render', error, info);
+  }
+
+  render() {
+    if (!this.state.error) return this.props.children;
+    return (
+      <section className="model-workspace loading-panel" role="alert">
+        <strong>Model screen could not be displayed.</strong>
+        <p>{this.state.error}</p>
+        <button onClick={() => this.setState({ error: '' })}>Try again</button>
+      </section>
+    );
+  }
 }
 
 function ModelManagement({ profile }: { profile: ConnectionProfile }) {
@@ -213,10 +244,19 @@ function ModelManagement({ profile }: { profile: ConnectionProfile }) {
     const connectEvents = () => {
       if (stopped) return;
       setLive('connecting');
-      const after = localStorage.getItem(cursorKey) ?? '0';
-      socket = new WebSocket(
-        `${base}/api/v1/events/ws?after_event_id=${after}`,
-      );
+      try {
+        const after = localStorage.getItem(cursorKey) ?? '0';
+        socket = new WebSocket(
+          `${base}/api/v1/events/ws?after_event_id=${after}`,
+        );
+      } catch (reason) {
+        console.warn(
+          'Live model events are unavailable; using polling.',
+          reason,
+        );
+        setLive('offline');
+        return;
+      }
       socket.onopen = () => setLive('live');
       socket.onmessage = (message) => {
         try {
