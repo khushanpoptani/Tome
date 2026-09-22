@@ -2,6 +2,7 @@ pub mod api;
 pub mod catalog;
 pub mod config;
 pub mod hardware;
+pub mod inference;
 pub mod model;
 pub mod models;
 pub mod network;

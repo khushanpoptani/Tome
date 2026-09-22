@@ -56,6 +56,30 @@ export interface Message {
   createdAt: string;
   parentMessageId: string | null;
   attachmentIds: string[];
+  generation?: MessageGeneration | null;
+}
+
+export interface MessageGeneration {
+  modelId: string;
+  modelArtifactSha256: string | null;
+  temperature: number;
+  maxOutputTokens: number;
+  jobId: string | null;
+  state: string;
+  outputSequence: number;
+  usage: Record<string, unknown> | null;
+  completionReason: string | null;
+  contextWarnings: string[];
+  retryOfJobId: string | null;
+}
+
+export interface PartialResponse {
+  id: string;
+  chatId: string;
+  messageId: string;
+  jobId: string | null;
+  content: string;
+  updatedAt: string;
 }
 
 export interface Chat extends Omit<ChatSummary, 'messageCount'> {
@@ -156,6 +180,24 @@ export const storage = {
   deleteProfile: (id: string) => command<void>('delete_profile', { id }),
   setEventCursor: (profileId: string, eventId: number) =>
     command<void>('set_event_cursor', { profileId, eventId }),
+  savePartialResponse: (
+    chatId: string,
+    messageId: string,
+    jobId: string | null,
+    content: string,
+  ) =>
+    command<PartialResponse>('save_partial_response', {
+      chatId,
+      messageId,
+      jobId,
+      content,
+    }),
+  loadPartialResponses: (chatId: string) =>
+    command<PartialResponse[]>('load_partial_responses', { chatId }),
+  clearPartialResponse: (chatId: string, messageId: string) =>
+    command<void>('clear_partial_response', { chatId, messageId }),
+  writeInteractionExport: (destination: string, content: string) =>
+    command<string>('write_interaction_export', { destination, content }),
   storeAttachment: (
     originalName: string,
     declaredMediaType: string | null,

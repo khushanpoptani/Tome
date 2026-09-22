@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     api::{AppState, router},
     config::NetworkMode,
+    inference::InferenceService,
     model::{JobState, JobType, PROTOCOL_VERSION},
     models::ModelManager,
     network::{AddressKind, classify_address},
@@ -95,6 +96,7 @@ impl ServerHandle {
         let worker = tokio::spawn(run_job_dispatcher(
             store.clone(),
             models.clone(),
+            InferenceService::new(store.clone(), models.clone()),
             shutdown.child_token(),
         ));
         let app = router(AppState {
@@ -191,6 +193,7 @@ fn network_mode(addresses: &[IpAddr]) -> NetworkMode {
 async fn run_job_dispatcher(
     store: JobStore,
     models: ModelManager,
+    inference: InferenceService,
     shutdown: CancellationToken,
 ) -> Result<(), StoreError> {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -212,6 +215,38 @@ async fn run_job_dispatcher(
                                         "code": "model_download_failed",
                                         "message": error.to_string(),
                                     })).await?;
+                                }
+                            }
+                        }
+                    } else if job.job_type == JobType::Inference {
+                        match inference.execute(&job).await {
+                            Ok(output) => {
+                                if store.get_job(&job.id).await?.state == JobState::Running {
+                                    store.complete_job(&job.id, output).await?;
+                                    store.inference_event(
+                                        &job.id,
+                                        crate::model::EventType::InferenceCompleted,
+                                        json!({ "schema_version": 1 }),
+                                    ).await?;
+                                }
+                            }
+                            Err(error) => {
+                                if store.get_job(&job.id).await?.state == JobState::Running {
+                                    let code = match &error {
+                                        crate::inference::InferenceError::ContextOverflow(_) => "context_overflow",
+                                        crate::inference::InferenceError::Invalid(_) => "invalid_inference_request",
+                                        _ => "inference_failed",
+                                    };
+                                    store.mark_inference_failed(&job.id).await?;
+                                    store.fail_job(&job.id, json!({
+                                        "code": code,
+                                        "message": error.to_string(),
+                                    })).await?;
+                                    store.inference_event(
+                                        &job.id,
+                                        crate::model::EventType::InferenceFailed,
+                                        json!({ "schema_version": 1, "code": code }),
+                                    ).await?;
                                 }
                             }
                         }
