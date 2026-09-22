@@ -1,6 +1,16 @@
 # Phase 1 server, networking, and persistent jobs
 
-Phase 1 provides a single-user server foundation for private LAN or Tailscale use. It has no app-level login. Do not place it on the public internet, forward its port from a router, or expose it through a public tunnel.
+Phase 1 provides a single-user server foundation for simultaneous private LAN and Tailscale use. The Windows product is a Tauri desktop host with a dashboard and system-tray lifecycle; the console binary remains a developer tool. It has no app-level login. Do not place it on the public internet, forward its port from a router, or expose it through a public tunnel.
+
+## Installed Windows host
+
+Install the NSIS package and launch **Tome Server** from the Start menu. First-run setup selects the port, private LAN and Tailscale access, Windows Firewall rules, the data directory, and optional launch at login. Administrator approval is required for the per-machine install and whenever firewall rules change.
+
+The dashboard reports stopped, starting, running, and error states; every eligible loopback, private LAN, and Tailscale address; active listeners; firewall and Tailscale health; recent server events; and copyable diagnostics. Closing the window keeps the server in the system tray. **Quit and stop server** in the tray gracefully stops listeners and job dispatch before exiting.
+
+Tome enumerates interfaces and binds a separate listener to each enabled, explicit trusted address. Loopback is always included. Private LAN and Tailscale can be enabled together. The host never binds `0.0.0.0`, `::`, or a detected public address. When adapters or addresses change, the dashboard asks for a restart rather than silently broadening access.
+
+The installer creates inbound TCP rules scoped to the installed executable and default port: `LocalSubnet` on the Windows Private profile for LAN, and `100.64.0.0/10` for Tailscale IPv4. The dashboard recreates those rules for a changed port. Uninstall removes both rules and launch-at-login registration, then explicitly asks whether local settings, job history, and other local data should also be removed. See [Windows server installation](windows-server.md) for the operator workflow.
 
 ## Configuration and network safety
 
@@ -14,19 +24,18 @@ Configuration comes from environment variables. The server never reads a checked
 | `TOME_DATABASE_PATH`      | `tome.sqlite3` | SQLite database path                               |
 | `TOME_TEMP_DIRECTORY`     | `tome-temp`    | Directory inspected for orphan temporary artifacts |
 | `TOME_JOB_RETENTION_DAYS` | `30`           | Terminal-job retention before startup cleanup      |
-| `TOME_ALLOW_PUBLIC_BIND`  | `false`        | Explicit override for wildcard/public binds        |
 | `RUST_LOG`                | `info`         | Structured log filter                              |
 
 The selected mode and bind address must agree:
 
 - `loopback` accepts only loopback addresses.
-- `lan` accepts loopback, RFC 1918/private, link-local, or IPv6 unique-local addresses.
+- `lan` accepts loopback, private or link-local IPv4, and IPv6 unique-local addresses. IPv6 link-local addresses are omitted because a safe bind also requires an adapter scope identifier.
 - `tailscale` accepts `100.64.0.0/10` and `fd7a:115c:a1e0::/48`.
-- Wildcard and public addresses fail validation unless `TOME_ALLOW_PUBLIC_BIND=true`. That override is deliberately noisy and should not be used for normal LAN or Tailscale operation.
+- Wildcard and public addresses always fail validation.
 
 Bind to the machine's exact LAN or Tailscale address. A firewall should restrict the port to the intended private network. The API permits browser access only from the packaged Tauri origins and the local Vite development origins; CORS is defense in depth, not authentication.
 
-Startup logs identify the effective address, mode, protocol version, and the fact that authentication is absent. `Ctrl+C` and `SIGTERM` initiate graceful HTTP shutdown. Jobs left in `running` are durably interrupted after the dispatcher stops.
+The environment variables above configure only the developer console host, which has one explicit listener. Startup logs identify the effective address, mode, protocol version, and the fact that authentication is absent. `Ctrl+C` and `SIGTERM` initiate graceful HTTP shutdown. Jobs left in `running` are durably interrupted after the dispatcher stops.
 
 ## Protocol and APIs
 
@@ -108,4 +117,4 @@ This is deliberately not the future client persistence layer. Phase 1 stores no 
 
 ## Validation
 
-Server tests cover configuration safety, migrations, idempotency conflicts, cancellation, state/event transactions, restart recovery, progress preservation, HTTP capability/error behavior, and WebSocket replay plus live delivery. Client tests cover profile storage/validation, address construction, state transitions, retries, capability retrieval, and protocol mismatch reporting. Run the repository-prescribed suite with `pnpm check`; use `pnpm build:web` and `pnpm build:server` for local build validation.
+Server tests cover configuration safety, simultaneous listeners, clean stop/restart, migrations, idempotency conflicts, cancellation, state/event transactions, restart recovery, progress preservation, HTTP capability/error behavior, and WebSocket replay plus live delivery. Dashboard tests cover address grouping and Tailscale setup states. Client tests cover profile storage/validation, address construction, state transitions, retries, capability retrieval, and protocol mismatch reporting. Run the repository-prescribed suite with `pnpm check`; use `pnpm build:server-dashboard:web` for local dashboard validation and `pnpm build:server:windows` on Windows for the NSIS installer.

@@ -11,6 +11,7 @@ dist/
 # Rust
 target/
 apps/client/src-tauri/gen/
+apps/server-dashboard/src-tauri/gen/
 
 # Editors
 .idea/

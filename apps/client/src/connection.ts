@@ -22,7 +22,7 @@ export interface ProtocolRange {
 export interface ServerCapabilities {
   protocol: ProtocolRange;
   authentication: 'none';
-  network_mode: 'loopback' | ConnectionMode;
+  network_mode: 'loopback' | 'multi' | ConnectionMode;
   features: {
     persistent_jobs: boolean;
     event_replay: boolean;

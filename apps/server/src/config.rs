@@ -11,6 +11,7 @@ pub enum NetworkMode {
     Loopback,
     Lan,
     Tailscale,
+    Multi,
 }
 
 impl FromStr for NetworkMode {
@@ -31,7 +32,6 @@ pub struct Config {
     pub bind_address: IpAddr,
     pub port: u16,
     pub network_mode: NetworkMode,
-    pub allow_public_bind: bool,
     pub database_path: PathBuf,
     pub temp_directory: PathBuf,
     pub retention_days: u32,
@@ -49,11 +49,11 @@ pub enum ConfigError {
     },
     #[error("loopback mode requires a loopback bind address")]
     LoopbackAddressRequired,
-    #[error("LAN mode requires a private, link-local, or loopback bind address")]
+    #[error("LAN mode requires a private IPv4, IPv6 unique-local, or loopback bind address")]
     PrivateAddressRequired,
     #[error("Tailscale mode requires an address in 100.64.0.0/10 or fd7a:115c:a1e0::/48")]
     TailscaleAddressRequired,
-    #[error("wildcard or public bind addresses require TOME_ALLOW_PUBLIC_BIND=true")]
+    #[error("wildcard and public bind addresses are not supported")]
     PublicBindNotAllowed,
 }
 
@@ -70,13 +70,11 @@ impl Config {
             .parse()?;
         let bind_address = parse_env("TOME_BIND_ADDRESS", "127.0.0.1")?;
         let port = parse_env("TOME_PORT", &DEFAULT_PORT.to_string())?;
-        let allow_public_bind = parse_bool_env("TOME_ALLOW_PUBLIC_BIND", false)?;
         let retention_days = parse_env("TOME_JOB_RETENTION_DAYS", "30")?;
         let config = Self {
             bind_address,
             port,
             network_mode,
-            allow_public_bind,
             database_path: PathBuf::from(
                 env_value("TOME_DATABASE_PATH").unwrap_or_else(|| "tome.sqlite3".to_owned()),
             ),
@@ -115,7 +113,7 @@ impl Config {
             || !(self.bind_address.is_loopback()
                 || is_private_or_link_local(self.bind_address)
                 || is_tailscale(self.bind_address));
-        if unsafe_address && !self.allow_public_bind {
+        if unsafe_address {
             return Err(ConfigError::PublicBindNotAllowed);
         }
 
@@ -125,14 +123,14 @@ impl Config {
             }
             NetworkMode::Lan
                 if !(self.bind_address.is_loopback()
-                    || is_private_or_link_local(self.bind_address)
-                    || self.allow_public_bind) =>
+                    || is_private_or_link_local(self.bind_address)) =>
             {
                 Err(ConfigError::PrivateAddressRequired)
             }
             NetworkMode::Tailscale if !is_tailscale(self.bind_address) => {
                 Err(ConfigError::TailscaleAddressRequired)
             }
+            NetworkMode::Multi => Err(ConfigError::InvalidMode("multi".to_owned())),
             _ => Ok(()),
         }
     }
@@ -154,25 +152,10 @@ where
     })
 }
 
-fn parse_bool_env(name: &'static str, default: bool) -> Result<bool, ConfigError> {
-    let Some(value) = env_value(name) else {
-        return Ok(default);
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" => Ok(true),
-        "false" | "0" | "no" => Ok(false),
-        _ => Err(ConfigError::InvalidValue {
-            name,
-            value,
-            reason: "expected true or false",
-        }),
-    }
-}
-
 fn is_private_or_link_local(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => address.is_private() || address.is_link_local(),
-        IpAddr::V6(address) => address.is_unique_local() || address.is_unicast_link_local(),
+        IpAddr::V6(address) => address.is_unique_local(),
     }
 }
 
@@ -198,7 +181,6 @@ mod tests {
             bind_address: address.parse().unwrap(),
             port: DEFAULT_PORT,
             network_mode: mode,
-            allow_public_bind: false,
             database_path: "test.sqlite3".into(),
             temp_directory: "temp".into(),
             retention_days: 30,
@@ -221,10 +203,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_override_allows_a_lan_wildcard_bind() {
-        let mut config = config(NetworkMode::Lan, "0.0.0.0");
-        config.allow_public_bind = true;
-        config.validate().unwrap();
+    fn public_address_is_always_rejected() {
+        assert_eq!(
+            config(NetworkMode::Lan, "8.8.8.8").validate(),
+            Err(ConfigError::PublicBindNotAllowed)
+        );
     }
 
     #[test]
