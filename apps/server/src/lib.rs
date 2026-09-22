@@ -1,6 +1,9 @@
 pub mod api;
+pub mod catalog;
 pub mod config;
+pub mod hardware;
 pub mod model;
+pub mod models;
 pub mod network;
 pub mod runtime;
 pub mod store;

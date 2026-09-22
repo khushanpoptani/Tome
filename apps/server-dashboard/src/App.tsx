@@ -6,6 +6,16 @@ import {
   groupAddresses,
   tailscaleMessage,
 } from './dashboard';
+import {
+  formatBytes,
+  loadLocalModels,
+  localDefault,
+  localDelete,
+  localDownload,
+  localJobAction,
+  localModelAction,
+  type LocalModelSnapshot,
+} from './models';
 
 interface Settings {
   port: number;
@@ -299,6 +309,10 @@ export function App() {
         </section>
         <div className="content-grid">
           <div className="main-column">
+            <ModelSetup
+              port={snapshot.settings.port}
+              running={snapshot.status === 'running'}
+            />
             <section className="panel">
               <div className="panel-heading">
                 <div>
@@ -524,5 +538,278 @@ export function App() {
         </div>
       )}
     </main>
+  );
+}
+
+function ModelSetup({ port, running }: { port: number; running: boolean }) {
+  const [models, setModels] = useState<LocalModelSnapshot | null>(null);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState('');
+  const refresh = useCallback(async () => {
+    if (!running) return;
+    try {
+      setModels(await loadLocalModels(port));
+      setError('');
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }, [port, running]);
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 4000);
+    return () => window.clearInterval(timer);
+  }, [refresh]);
+  const action = async (key: string, work: () => Promise<unknown>) => {
+    setBusy(key);
+    setError('');
+    try {
+      await work();
+      await refresh();
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setBusy('');
+    }
+  };
+  if (!running)
+    return (
+      <section className="panel model-panel">
+        <span className="eyebrow">MODELS</span>
+        <h2>Start the server to manage models</h2>
+      </section>
+    );
+  if (!models)
+    return (
+      <section className="panel model-panel">
+        <span className="eyebrow">MODELS</span>
+        <h2>Inspecting hardware and model storage…</h2>
+        {error && <div className="error-banner">{error}</div>}
+      </section>
+    );
+  const active = models.jobs.filter((job) =>
+    ['queued', 'running', 'interrupted', 'failed'].includes(job.state),
+  );
+  return (
+    <section className="panel model-panel">
+      <div className="panel-heading">
+        <div>
+          <span className="eyebrow">MODEL SETUP</span>
+          <h2>
+            {models.inventory.ready
+              ? 'Server model-ready'
+              : 'Install your first text model'}
+          </h2>
+        </div>
+        <span className={`readiness ${models.inventory.ready ? 'ready' : ''}`}>
+          {models.inventory.ready ? 'Ready' : 'Setup needed'}
+        </span>
+      </div>
+      {error && <div className="error-banner">{error}</div>}
+      <div className="hardware-summary">
+        <ModelMetric
+          label="CPU / RAM"
+          value={`${models.hardware.cpu_brand ?? models.hardware.cpu_architecture} · ${formatBytes(models.hardware.total_memory_bytes)}`}
+        />
+        <ModelMetric
+          label="GPU"
+          value={models.hardware.gpu.name ?? 'Unknown / CPU'}
+          detail={models.hardware.gpu.memory_note}
+        />
+        <ModelMetric
+          label="Storage"
+          value={`${formatBytes(models.hardware.model_storage.free_bytes)} free`}
+          detail={models.hardware.model_storage.root}
+        />
+        <ModelMetric
+          label="Runtime"
+          value={
+            models.hardware.runtime.llama_cpp.available
+              ? 'llama.cpp available'
+              : 'llama.cpp unavailable'
+          }
+          detail={models.hardware.runtime.llama_cpp.reason}
+        />
+      </div>
+      {!models.inventory.ready && (
+        <div className="profile-list">
+          {models.setup.profiles
+            .filter((profile) => profile.id !== 'manual')
+            .map((profile) => (
+              <button
+                key={profile.id}
+                className="profile-card"
+                disabled={!profile.compatible || busy !== ''}
+                title={profile.exclusion_reasons.join(' ')}
+                onClick={() =>
+                  void action(profile.id, async () => {
+                    for (const id of profile.entry_ids)
+                      await localDownload(port, id);
+                  })
+                }
+              >
+                <strong>{profile.name}</strong>
+                <span>{formatBytes(profile.download_bytes)}</span>
+                <small>
+                  {profile.compatible
+                    ? 'Compatible with detected server'
+                    : profile.exclusion_reasons.join(' ')}
+                </small>
+              </button>
+            ))}
+        </div>
+      )}
+      {active.map((job) => (
+        <div className="model-download" key={job.id}>
+          <div>
+            <strong>{job.input.catalog_id}</strong>
+            <small>
+              {job.state} · {Math.round(job.progress * 100)}%
+            </small>
+          </div>
+          <progress value={job.progress} max={1} />
+          <div>
+            {job.state === 'interrupted' ? (
+              <button
+                className="quiet-button"
+                onClick={() =>
+                  void action(job.id, () =>
+                    localJobAction(port, job.id, 'resume'),
+                  )
+                }
+              >
+                Resume
+              </button>
+            ) : (
+              <button
+                className="quiet-button"
+                onClick={() =>
+                  void action(job.id, () =>
+                    localJobAction(port, job.id, 'pause'),
+                  )
+                }
+              >
+                Pause
+              </button>
+            )}{' '}
+            {['queued', 'running'].includes(job.state) && (
+              <button
+                className="danger-button"
+                onClick={() =>
+                  void action(job.id, () =>
+                    localJobAction(port, job.id, 'cancel'),
+                  )
+                }
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        </div>
+      ))}
+      <div className="installed-list">
+        {models.inventory.models.map((model) => (
+          <div className="installed-model" key={model.id}>
+            <div>
+              <strong>{model.display_name}</strong>
+              <small>
+                {model.quantization} · {formatBytes(model.byte_size)} ·{' '}
+                {model.compatibility_state}
+              </small>
+              <p>{model.compatibility_reason}</p>
+            </div>
+            <div className="model-buttons">
+              <button
+                className="quiet-button"
+                disabled={models.inventory.default_model_id === model.id}
+                onClick={() =>
+                  void action(model.id, () => localDefault(port, model.id))
+                }
+              >
+                {models.inventory.default_model_id === model.id
+                  ? 'Default'
+                  : 'Set default'}
+              </button>
+              <button
+                className="primary-button"
+                disabled={model.compatibility_state !== 'compatible'}
+                onClick={() =>
+                  void action(model.id, () =>
+                    localModelAction(
+                      port,
+                      model.id,
+                      model.loaded ? 'unload' : 'load',
+                    ),
+                  )
+                }
+              >
+                {model.loaded ? 'Unload' : 'Load'}
+              </button>
+              <button
+                className="danger-button"
+                disabled={model.loaded || model.in_use_count > 0}
+                onClick={() => {
+                  if (
+                    window.confirm(
+                      `Move ${model.display_name} to recoverable trash?`,
+                    )
+                  )
+                    void action(model.id, () => localDelete(port, model.id));
+                }}
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <details className="catalog-details">
+        <summary>Approved catalog · {models.catalog.catalog_version}</summary>
+        <div className="dashboard-catalog">
+          {models.catalog.entries.map((entry) => {
+            const installed = models.inventory.models.some(
+              (model) => model.catalog_id === entry.id,
+            );
+            return (
+              <article key={entry.id}>
+                <span>{entry.roles.join(' · ')}</span>
+                <strong>{entry.name}</strong>
+                <p>{entry.reason}</p>
+                <small>
+                  {entry.runtime_status.replace('_', ' ')} · {entry.license} ·{' '}
+                  {formatBytes(entry.bytes)}
+                </small>
+                <button
+                  className="primary-button"
+                  disabled={installed || busy !== ''}
+                  onClick={() =>
+                    void action(entry.id, () => localDownload(port, entry.id))
+                  }
+                >
+                  {installed ? 'Installed' : 'Accept license & download'}
+                </button>
+              </article>
+            );
+          })}
+        </div>
+      </details>
+    </section>
+  );
+}
+
+function ModelMetric({
+  label,
+  value,
+  detail,
+}: {
+  label: string;
+  value: string;
+  detail?: string;
+}) {
+  return (
+    <div className="model-metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      {detail && <small>{detail}</small>}
+    </div>
   );
 }
