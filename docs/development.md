@@ -63,6 +63,17 @@ For Tailscale, use the machine's `100.64.0.0/10` address (or Tailscale IPv6 addr
 
 Tome detects `llama-server` on `PATH`. Set `TOME_LLAMA_SERVER_PATH` to an explicit reviewed executable when it is installed elsewhere. The executable is probed with a three-second timeout and is only used for verified GGUF models. Model files, resumable partials, and recoverable deletions live beside the configured database under `models/`, `model-downloads/`, and `model-trash/`. See [Phase 2 model management](phase-2-model-management.md).
 
+## Phase 3 client storage
+
+The packaged client stores authoritative product data below Tauri's platform application-data directory for `com.khushanpoptani.tome`. Never test destructive storage behavior against that real directory. Native storage tests use temporary directories:
+
+```sh
+cargo test -p tome-client --locked
+pnpm --filter @tome/client test
+```
+
+The browser-only Vite preview intentionally cannot persist client records; use `pnpm dev:client` to exercise native storage, import/export, and delete-all behavior. See [Phase 3 client storage](phase-3-client-storage.md) for the data layout and manual validation checklist.
+
 ## Distribution builds
 
 Build the Apple Silicon DMG on macOS:

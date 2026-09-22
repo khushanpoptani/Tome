@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-window",
-  "description": "Minimum desktop permissions for the Phase 1 connection screen",
+  "description": "Minimum desktop permissions for the Phase 3 local client and private server connections",
   "windows": ["main"],
   "permissions": [
     "core:default",

@@ -1,17 +1,9 @@
 import { isTauri } from '@tauri-apps/api/core';
 import { fetch as tauriFetch } from '@tauri-apps/plugin-http';
+import type { ServerProfile } from './client-storage';
 
 export const CLIENT_PROTOCOL_VERSION = 1;
-const STORAGE_KEY = 'tome.phase1.connection-profile';
-
-export type ConnectionMode = 'lan' | 'tailscale';
-
-export interface ConnectionProfile {
-  name: string;
-  mode: ConnectionMode;
-  host: string;
-  port: number;
-}
+export type ConnectionProfile = ServerProfile;
 
 export interface ProtocolRange {
   current: number;
@@ -22,7 +14,7 @@ export interface ProtocolRange {
 export interface ServerCapabilities {
   protocol: ProtocolRange;
   authentication: 'none';
-  network_mode: 'loopback' | 'multi' | ConnectionMode;
+  network_mode: 'loopback' | 'multi' | ServerProfile['mode'];
   features: {
     persistent_jobs: boolean;
     event_replay: boolean;
@@ -40,6 +32,8 @@ export type ConnectionState =
   | { status: 'connecting' }
   | { status: 'reconnecting'; attempt: number }
   | { status: 'connected'; capabilities: ServerCapabilities }
+  | { status: 'offline'; message: string }
+  | { status: 'incompatible'; message: string }
   | { status: 'error'; message: string };
 
 export interface ConnectOptions {
@@ -59,6 +53,11 @@ export function validateProfile(profile: ConnectionProfile): string | null {
   }
   if (host === '0.0.0.0' || host === '::' || host === '[::]') {
     return 'A wildcard address cannot be used as a connection destination.';
+  }
+  if (isPublicIpLiteral(host, profile.mode)) {
+    return profile.mode === 'tailscale'
+      ? 'Tailscale profiles require a 100.64.0.0/10 address, Tailscale IPv6 address, or MagicDNS name.'
+      : 'LAN profiles cannot use a public IP address.';
   }
   if (
     !Number.isInteger(profile.port) ||
@@ -127,7 +126,7 @@ export async function connectToServer(
             typeof details?.minimum === 'number' &&
             typeof details.maximum === 'number'
           ) {
-            return emitError(
+            return emitIncompatible(
               options,
               `Protocol mismatch: this client supports ${CLIENT_PROTOCOL_VERSION}, but the server accepts ${details.minimum}–${details.maximum}.`,
             );
@@ -137,7 +136,7 @@ export async function connectToServer(
       }
       const capabilities = (await response.json()) as ServerCapabilities;
       if (!isProtocolCompatible(capabilities.protocol)) {
-        return emitError(
+        return emitIncompatible(
           options,
           `Protocol mismatch: this client supports ${CLIENT_PROTOCOL_VERSION}, but the server accepts ${capabilities.protocol.minimum}–${capabilities.protocol.maximum}.`,
         );
@@ -159,38 +158,59 @@ export async function connectToServer(
       }
     }
   }
-  return emitError(
-    options,
-    `Could not reach the server. Check its address, port, and network.${lastFailure ? ` ${lastFailure}` : ''}`,
-  );
-}
-
-export function saveProfile(
-  profile: ConnectionProfile,
-  storage: Storage = localStorage,
-): void {
-  const error = validateProfile(profile);
-  if (error) throw new Error(error);
-  storage.setItem(STORAGE_KEY, JSON.stringify(profile));
-}
-
-export function loadProfile(
-  storage: Storage = localStorage,
-): ConnectionProfile | null {
-  const stored = storage.getItem(STORAGE_KEY);
-  if (!stored) return null;
-  try {
-    const profile = JSON.parse(stored) as ConnectionProfile;
-    return validateProfile(profile) ? null : profile;
-  } catch {
-    return null;
-  }
+  const state: ConnectionState = {
+    status: 'offline',
+    message: `Could not reach the server. Check its address, port, and network.${lastFailure ? ` ${lastFailure}` : ''}`,
+  };
+  options.onState?.(state);
+  return state;
 }
 
 function emitError(options: ConnectOptions, message: string): ConnectionState {
   const state: ConnectionState = { status: 'error', message };
   options.onState?.(state);
   return state;
+}
+
+function emitIncompatible(
+  options: ConnectOptions,
+  message: string,
+): ConnectionState {
+  const state: ConnectionState = { status: 'incompatible', message };
+  options.onState?.(state);
+  return state;
+}
+
+function isPublicIpLiteral(host: string, mode: ServerProfile['mode']): boolean {
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const octets = ipv4.slice(1).map(Number);
+    if (octets.some((octet) => octet > 255)) return true;
+    const [a, b] = octets;
+    const tailscale = a === 100 && b >= 64 && b <= 127;
+    if (mode === 'tailscale') return !tailscale;
+    return !(
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168)
+    );
+  }
+  if (host.includes(':')) {
+    const normalized = host.replace(/^\[|\]$/g, '').toLowerCase();
+    if (mode === 'tailscale') return !normalized.startsWith('fd7a:115c:a1e0:');
+    return !(
+      normalized === '::1' ||
+      normalized.startsWith('fc') ||
+      normalized.startsWith('fd') ||
+      normalized.startsWith('fe8') ||
+      normalized.startsWith('fe9') ||
+      normalized.startsWith('fea') ||
+      normalized.startsWith('feb')
+    );
+  }
+  return false;
 }
 
 function describeFailure(error: unknown): string {
