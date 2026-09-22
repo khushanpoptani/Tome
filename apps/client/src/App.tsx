@@ -10,6 +10,10 @@ import {
   type ReactNode,
 } from 'react';
 import {
+  confirm as confirmDialog,
+  save as saveDialog,
+} from '@tauri-apps/plugin-dialog';
+import {
   connectToServer,
   type ConnectionProfile,
   type ConnectionState,
@@ -53,6 +57,8 @@ export function App() {
     status: 'disconnected',
   });
   const [error, setError] = useState('');
+  const [chatQuery, setChatQuery] = useState('');
+  const [sidebarChats, setSidebarChats] = useState(data?.chats ?? []);
   const refresh = useCallback(async () => {
     try {
       const next = await storage.bootstrap();
@@ -84,12 +90,49 @@ export function App() {
     void refresh();
   }, [refresh]);
 
+  useEffect(() => {
+    if (!data) return;
+    const timer = window.setTimeout(() => {
+      storage
+        .searchChats(chatQuery)
+        .then(setSidebarChats)
+        .catch((reason) => setError(String(reason)));
+    }, 150);
+    return () => window.clearTimeout(timer);
+  }, [chatQuery, data]);
+
   async function openChat(id: string) {
     try {
       setSelectedChat(await storage.getChat(id));
       setScreen('chats');
     } catch (reason) {
       setError(String(reason));
+    }
+  }
+
+  async function createChat() {
+    try {
+      const chat = await storage.createChat(
+        'Untitled chat',
+        profile?.id ?? null,
+      );
+      await refresh();
+      await openChat(chat.id);
+    } catch (reason) {
+      setError(String(reason));
+    }
+  }
+
+  async function importChat(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const chat = await storage.importChat(await file.text());
+      await refresh();
+      await openChat(chat.id);
+    } catch (reason) {
+      setError(`Import failed: ${String(reason)}`);
     }
   }
 
@@ -116,15 +159,55 @@ export function App() {
           <span>T</span>
           <strong>Tome</strong>
         </div>
+        <button className="sidebar-new-chat" onClick={() => void createChat()}>
+          <span>＋</span> New chat
+        </button>
+        <div className="sidebar-chat-heading">
+          <span>Chats</span>
+          <label>
+            Import
+            <input
+              type="file"
+              accept=".json,.tome.json,application/json"
+              hidden
+              onChange={(event) => void importChat(event)}
+            />
+          </label>
+        </div>
+        <input
+          className="sidebar-search"
+          aria-label="Search local chats"
+          placeholder="Search chats"
+          value={chatQuery}
+          onChange={(event) => setChatQuery(event.target.value)}
+        />
+        <div className="sidebar-chat-list">
+          {sidebarChats.map((chat) => (
+            <button
+              key={chat.id}
+              className={`sidebar-chat-item${
+                selectedChat?.id === chat.id ? ' selected' : ''
+              }`}
+              onClick={() => void openChat(chat.id)}
+            >
+              <strong>{chat.title}</strong>
+              <small>{new Date(chat.updatedAt).toLocaleDateString()}</small>
+            </button>
+          ))}
+          {sidebarChats.length === 0 && (
+            <p>{chatQuery ? 'No matching chats' : 'No chats yet'}</p>
+          )}
+        </div>
         <nav aria-label="Main navigation">
           {(
             ['chats', 'connections', 'models', 'jobs', 'settings'] as Screen[]
           ).map((item) => (
             <button
               key={item}
-              className={screen === item ? 'active' : ''}
+              className={`sidebar-nav-item${screen === item ? ' active' : ''}`}
               onClick={() => setScreen(item)}
             >
+              <span aria-hidden="true">{navigationIcon(item)}</span>
               {item[0].toUpperCase() + item.slice(1)}
             </button>
           ))}
@@ -170,11 +253,9 @@ export function App() {
         )}
         {screen === 'chats' && (
           <ChatsScreen
-            data={data}
             selected={selectedChat}
-            profile={profile}
-            onOpen={(id) => void openChat(id)}
             onRefresh={refresh}
+            onOpen={(id) => void openChat(id)}
             onError={setError}
           />
         )}
@@ -242,211 +323,212 @@ function PageHeader({
 }
 
 function ChatsScreen({
-  data,
   selected,
-  profile,
-  onOpen,
   onRefresh,
+  onOpen,
   onError,
 }: {
-  data: Bootstrap;
   selected: Chat | null;
-  profile: ServerProfile | null;
-  onOpen: (id: string) => void;
   onRefresh: () => Promise<void>;
+  onOpen: (id: string) => void;
   onError: (message: string) => void;
 }) {
-  const [query, setQuery] = useState('');
-  const [chats, setChats] = useState(data.chats);
-  useEffect(() => setChats(data.chats), [data.chats]);
-  useEffect(() => {
-    const timer = window.setTimeout(() => {
-      storage
-        .searchChats(query)
-        .then(setChats)
-        .catch((reason) => onError(String(reason)));
-    }, 150);
-    return () => window.clearTimeout(timer);
-  }, [query, onError]);
+  const [dialog, setDialog] = useState<'rename' | 'delete' | null>(null);
+  const [renameTitle, setRenameTitle] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState('');
 
-  async function create() {
-    try {
-      const chat = await storage.createChat(
-        'Untitled chat',
-        profile?.id ?? null,
-      );
-      await onRefresh();
-      onOpen(chat.id);
-    } catch (reason) {
-      onError(String(reason));
-    }
-  }
-
-  async function importFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    event.target.value = '';
-    if (!file) return;
-    try {
-      const chat = await storage.importChat(await file.text());
-      await onRefresh();
-      onOpen(chat.id);
-    } catch (reason) {
-      onError(`Import failed: ${String(reason)}`);
-    }
+  function beginRename(chat: Chat) {
+    setRenameTitle(chat.title);
+    setDialog('rename');
+    setNotice('');
   }
 
   async function rename(chat: Chat) {
-    const title = window.prompt('Rename this local chat', chat.title)?.trim();
+    const title = renameTitle.trim();
     if (!title) return;
+    setBusy(true);
     try {
       await storage.renameChat(chat.id, title);
       await onRefresh();
       onOpen(chat.id);
+      setDialog(null);
+      setNotice('Chat renamed.');
     } catch (reason) {
       onError(String(reason));
+    } finally {
+      setBusy(false);
     }
   }
 
   async function remove(chat: Chat) {
-    if (
-      !window.confirm(
-        `Delete “${chat.title}” and its client-managed attachment references? This cannot be undone.`,
-      )
-    )
-      return;
+    setBusy(true);
     try {
       await storage.deleteChat(chat.id);
       await onRefresh();
+      setDialog(null);
+      setNotice('Chat deleted from this Mac.');
     } catch (reason) {
       onError(String(reason));
+    } finally {
+      setBusy(false);
     }
   }
 
   async function exportOne(chat: Chat) {
     try {
-      const text = await storage.exportChat(chat.id);
-      const url = URL.createObjectURL(
-        new Blob([text], { type: 'application/json' }),
-      );
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = chatDownloadName(chat);
-      anchor.click();
-      URL.revokeObjectURL(url);
+      const destination = await saveDialog({
+        title: 'Export Tome chat',
+        defaultPath: chatDownloadName(chat),
+        filters: [{ name: 'Tome chat', extensions: ['json'] }],
+      });
+      if (!destination) return;
+      await storage.exportChatFile(chat.id, destination);
+      setNotice(`Exported ${chatDownloadName(chat)}.`);
     } catch (reason) {
       onError(String(reason));
     }
   }
 
   return (
-    <div className="chat-layout">
-      <section className="chat-list-panel" aria-label="Local chats">
-        <div className="chat-list-actions">
-          <button onClick={() => void create()}>New chat</button>
-          <label className="button secondary">
-            Import
-            <input
-              type="file"
-              accept=".json,.tome.json,application/json"
-              hidden
-              onChange={(event) => void importFile(event)}
-            />
-          </label>
-        </div>
-        <input
-          aria-label="Search local chats"
-          placeholder="Search local chats"
-          value={query}
-          onChange={(event) => setQuery(event.target.value)}
-        />
-        <p className="storage-label">
-          Stored on this Mac · {formatBytes(data.usage.chatBytes)}
-        </p>
-        <div className="chat-items">
-          {chats.map((chat) => (
-            <button
-              key={chat.id}
-              className={selected?.id === chat.id ? 'selected' : ''}
-              onClick={() => onOpen(chat.id)}
-            >
-              <strong>{chat.title}</strong>
-              <small>
-                {new Date(chat.updatedAt).toLocaleString()} ·{' '}
-                {chat.messageCount} messages
-              </small>
-            </button>
-          ))}
-          {chats.length === 0 && (
-            <p className="empty-message">
-              {query
-                ? 'No local chats match your search.'
-                : 'Create or import your first local chat.'}
+    <section className="conversation-workspace">
+      {selected ? (
+        <>
+          <PageHeader eyebrow="Stored on this Mac" title={selected.title}>
+            <div className="row-actions chat-actions">
+              <button
+                className="secondary"
+                onClick={() => void exportOne(selected)}
+              >
+                Export
+              </button>
+              <button
+                className="secondary"
+                onClick={() => beginRename(selected)}
+              >
+                Rename
+              </button>
+              <button
+                className="danger-quiet"
+                onClick={() => setDialog('delete')}
+              >
+                Delete
+              </button>
+            </div>
+          </PageHeader>
+          {notice && (
+            <p className="success-message" role="status">
+              {notice}
             </p>
           )}
-        </div>
-      </section>
-      <section className="conversation-placeholder">
-        {selected ? (
-          <>
-            <PageHeader eyebrow="Client-local chat" title={selected.title}>
-              <div className="row-actions">
-                <button
-                  className="secondary"
-                  onClick={() => void exportOne(selected)}
-                >
-                  Export
-                </button>
-                <button
-                  className="secondary"
-                  onClick={() => void rename(selected)}
-                >
-                  Rename
-                </button>
-                <button
-                  className="danger"
-                  onClick={() => void remove(selected)}
-                >
-                  Delete
-                </button>
-              </div>
-            </PageHeader>
-            <div className="phase-placeholder">
-              <span>Phase 4</span>
-              <h2>Conversation and inference arrive next.</h2>
-              <p>
-                This phase establishes durable local chat records. There is
-                intentionally no prompt composer, send button, or inference
-                pipeline yet.
-              </p>
-              <dl>
-                <div>
-                  <dt>Server profile</dt>
-                  <dd>
-                    {data.profiles.find(
-                      ({ id }) => id === selected.serverProfileId,
-                    )?.name ?? 'Missing or not selected'}
-                  </dd>
-                </div>
-                <div>
-                  <dt>Model reference</dt>
-                  <dd>{selected.modelId ?? 'Not selected'}</dd>
-                </div>
-              </dl>
-            </div>
-          </>
-        ) : (
           <div className="phase-placeholder">
-            <span>Local workspace</span>
-            <h2>Select a chat or begin a new one.</h2>
+            <span>Phase 4</span>
+            <h2>Ready for conversation in the next phase</h2>
             <p>
-              Chat browsing, search, import, export, and settings stay available
-              while every server is offline.
+              This chat is stored safely on this Mac. Prompting and inference
+              are intentionally unavailable until Phase 4.
             </p>
           </div>
-        )}
-      </section>
-    </div>
+          {dialog && (
+            <div className="modal-backdrop" role="presentation">
+              <div
+                className="app-dialog"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="chat-dialog-title"
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape' && !busy) setDialog(null);
+                }}
+              >
+                {dialog === 'rename' ? (
+                  <form
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void rename(selected);
+                    }}
+                  >
+                    <div>
+                      <p className="eyebrow">Local chat</p>
+                      <h2 id="chat-dialog-title">Rename chat</h2>
+                      <p>Choose a clear name for this chat in your sidebar.</p>
+                    </div>
+                    <label>
+                      Chat name
+                      <input
+                        autoFocus
+                        maxLength={200}
+                        value={renameTitle}
+                        onChange={(event) => setRenameTitle(event.target.value)}
+                      />
+                    </label>
+                    <div className="actions">
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() => setDialog(null)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="submit"
+                        disabled={busy || !renameTitle.trim()}
+                      >
+                        {busy ? 'Renaming…' : 'Rename chat'}
+                      </button>
+                    </div>
+                  </form>
+                ) : (
+                  <div>
+                    <p className="eyebrow">Permanent action</p>
+                    <h2 id="chat-dialog-title">Delete “{selected.title}”?</h2>
+                    <p>
+                      This removes the local chat and its client-managed
+                      attachment references. Exported files are not affected.
+                    </p>
+                    <div className="actions">
+                      <button
+                        className="secondary"
+                        disabled={busy}
+                        onClick={() => setDialog(null)}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className="danger"
+                        disabled={busy}
+                        onClick={() => void remove(selected)}
+                      >
+                        {busy ? 'Deleting…' : 'Delete chat'}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="phase-placeholder empty-workspace">
+          <div className="empty-mark">T</div>
+          <h2>Select a chat or start a new one</h2>
+          <p>
+            Your local chats stay available even when every server is offline.
+          </p>
+        </div>
+      )}
+    </section>
   );
+}
+
+function navigationIcon(screen: Screen): string {
+  return {
+    chats: '◫',
+    connections: '⌁',
+    models: '◇',
+    jobs: '◷',
+    settings: '⚙',
+  }[screen];
 }
 
 function ConnectionsScreen({
@@ -550,13 +632,12 @@ function ConnectionsScreen({
     }
   }
   async function remove() {
-    if (
-      !selected ||
-      !window.confirm(
-        `Delete the saved connection “${selected.name}”? Local chats keep their stable reference and will show the profile as missing.`,
-      )
-    )
-      return;
+    if (!selected) return;
+    const confirmed = await confirmDialog(
+      `Delete “${selected.name}”? Local chats keep their stable reference and will show the profile as missing.`,
+      { title: 'Delete saved connection?', kind: 'warning' },
+    );
+    if (!confirmed) return;
     try {
       await storage.deleteProfile(selected.id);
       onSelect(null);
@@ -1505,14 +1586,18 @@ function ModelManagement({
                 <button
                   className="danger"
                   disabled={model.loaded || model.in_use_count > 0}
-                  onClick={() => {
-                    if (
-                      window.confirm(
+                  onClick={() =>
+                    void (async () => {
+                      const confirmed = await confirmDialog(
                         `Move ${model.display_name} to Tome's recoverable model trash?`,
-                      )
-                    )
-                      void run(model.id, () => deleteModel(profile, model.id));
-                  }}
+                        { title: 'Delete server model?', kind: 'warning' },
+                      );
+                      if (confirmed)
+                        await run(model.id, () =>
+                          deleteModel(profile, model.id),
+                        );
+                    })()
+                  }
                 >
                   Delete
                 </button>

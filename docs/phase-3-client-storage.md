@@ -88,7 +88,7 @@ Deleting a profile clears default/last-used settings and its default-model prefe
 
 Import accepts one UTF-8 Tome JSON object up to 16 MiB, runs migration and validation, ignores external path intent, and writes a native chat record. A colliding chat ID receives a new UUID and preserves the source ID only as inert metadata. Import does not copy attachments in Phase 3.
 
-Export serializes one validated chat as readable JSON and recursively removes fields named like credentials, tokens, Authorization headers, or signed URLs. The browser download is a portable file chosen by the user, not client-managed after download.
+Export serializes one validated chat as readable JSON and recursively removes fields named like credentials, tokens, Authorization headers, or signed URLs. A native save panel lets the user choose an external destination, and the Rust storage command writes the portable file outside Tome's managed data root so delete-all cannot touch it.
 
 ## Delete all client data
 

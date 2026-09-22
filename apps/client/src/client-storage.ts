@@ -147,6 +147,8 @@ export const storage = {
     command<ChatSummary[]>('search_chats', { query }),
   importChat: (jsonText: string) => command<Chat>('import_chat', { jsonText }),
   exportChat: (id: string) => command<string>('export_chat', { id }),
+  exportChatFile: (id: string, destination: string) =>
+    command<string>('export_chat_file', { id, destination }),
   saveSettings: (settings: ClientSettings) =>
     command<ClientSettings>('save_settings', { settings }),
   upsertProfile: (profile: ServerProfile) =>

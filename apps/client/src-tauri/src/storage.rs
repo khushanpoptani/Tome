@@ -947,15 +947,75 @@ pub fn export_chat(
     storage: State<'_, ClientStorage>,
     id: String,
 ) -> std::result::Result<String, String> {
+    export_chat_inner(&storage, &id).map_err(|error| error.to_string())
+}
+
+fn export_chat_inner(storage: &ClientStorage, id: &str) -> Result<String> {
     let _lock = storage.gate.lock().expect("storage lock poisoned");
-    let path = storage.chat_path(&id).map_err(|error| error.to_string())?;
-    let chat = recover_json_validated::<Chat>(&path, "chat", validate_chat)
-        .map_err(|error| error.to_string())?;
-    let mut value = serde_json::to_value(chat).map_err(|error| error.to_string())?;
+    let path = storage.chat_path(id)?;
+    let chat = recover_json_validated::<Chat>(&path, "chat", validate_chat)?;
+    let mut value = serde_json::to_value(chat)?;
     redact_sensitive(&mut value);
     serde_json::to_string_pretty(&value)
         .map(|text| format!("{text}\n"))
+        .map_err(StorageError::from)
+}
+
+#[tauri::command]
+pub fn export_chat_file(
+    storage: State<'_, ClientStorage>,
+    id: String,
+    destination: String,
+) -> std::result::Result<String, String> {
+    export_chat_file_inner(&storage, &id, Path::new(&destination))
+        .map(|path| path.display().to_string())
         .map_err(|error| error.to_string())
+}
+
+fn export_chat_file_inner(
+    storage: &ClientStorage,
+    id: &str,
+    destination: &Path,
+) -> Result<PathBuf> {
+    if !destination.is_absolute() || destination.file_name().is_none() {
+        return Err(StorageError::Invalid("export destination"));
+    }
+    let parent = destination
+        .parent()
+        .ok_or(StorageError::Invalid("export destination"))?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    if canonical_parent.starts_with(&storage.root) {
+        return Err(StorageError::Invalid(
+            "export destination inside managed data root",
+        ));
+    }
+    let file_name = destination
+        .file_name()
+        .ok_or(StorageError::Invalid("export file name"))?;
+    let destination = canonical_parent.join(file_name);
+    let text = export_chat_inner(storage, id)?;
+    let temporary = canonical_parent.join(format!(".tome-export-{}.tmp", Uuid::now_v7()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    if let Err(error) = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    drop(file);
+    if destination.exists() {
+        fs::remove_file(&destination)?;
+    }
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    sync_directory(&canonical_parent);
+    Ok(destination)
 }
 
 #[tauri::command]
@@ -2093,6 +2153,30 @@ mod tests {
             import_chat_inner(&storage, &value.to_string()),
             Err(StorageError::Invalid("credential-like chat field"))
         ));
+    }
+
+    #[test]
+    fn native_export_writes_only_to_a_user_selected_external_directory() {
+        let (temporary, storage) = storage();
+        let chat = create_chat_inner(&storage, "Export me".into(), None).unwrap();
+        let export_directory = temporary.path().join("exports");
+        fs::create_dir(&export_directory).unwrap();
+        let destination = export_directory.join("chat.tome.json");
+        let written = export_chat_file_inner(&storage, &chat.id, &destination).unwrap();
+        assert_eq!(written, fs::canonicalize(&destination).unwrap());
+        assert!(
+            fs::read_to_string(destination)
+                .unwrap()
+                .contains("Export me")
+        );
+        assert!(
+            export_chat_file_inner(
+                &storage,
+                &chat.id,
+                &storage.safe_path("export-cache/chat.json").unwrap(),
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -5,6 +5,7 @@ use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_http::init())
         .setup(|app| {
             let root = app.path().app_data_dir()?;
@@ -21,6 +22,7 @@ fn main() {
             storage::search_chats,
             storage::import_chat,
             storage::export_chat,
+            storage::export_chat_file,
             storage::save_settings,
             storage::upsert_profile,
             storage::delete_profile,
