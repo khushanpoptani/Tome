@@ -59,6 +59,10 @@ TOME_NETWORK_MODE=lan TOME_BIND_ADDRESS=192.168.1.20 cargo run -p tome-server
 
 For Tailscale, use the machine's `100.64.0.0/10` address (or Tailscale IPv6 address) and set `TOME_NETWORK_MODE=tailscale`. See [Phase 1 server and jobs](phase-1-server.md) for all configuration, safety constraints, and API details.
 
+## Phase 2 model runtime
+
+Tome detects `llama-server` on `PATH`. Set `TOME_LLAMA_SERVER_PATH` to an explicit reviewed executable when it is installed elsewhere. The executable is probed with a three-second timeout and is only used for verified GGUF models. Model files, resumable partials, and recoverable deletions live beside the configured database under `models/`, `model-downloads/`, and `model-trash/`. See [Phase 2 model management](phase-2-model-management.md).
+
 ## Distribution builds
 
 Build the Apple Silicon DMG on macOS:

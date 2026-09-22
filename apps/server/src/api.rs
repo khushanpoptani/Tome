@@ -11,7 +11,7 @@ use axum::{
     http::{HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,6 +22,7 @@ use uuid::Uuid;
 use crate::{
     config::NetworkMode,
     model::{API_VERSION, Job, JobEvent, JobState, JobType, PROTOCOL_VERSION},
+    models::{DownloadSubmission, ModelError, ModelManager},
     store::{CreateJob, JobStore, StoreError},
 };
 
@@ -29,6 +30,7 @@ use crate::{
 pub struct AppState {
     pub store: JobStore,
     pub network_mode: NetworkMode,
+    pub models: ModelManager,
 }
 
 #[derive(Debug, Serialize)]
@@ -96,6 +98,36 @@ impl From<StoreError> for ApiError {
     }
 }
 
+impl From<ModelError> for ApiError {
+    fn from(error: ModelError) -> Self {
+        let (status, code) = match &error {
+            ModelError::CatalogEntryNotFound | ModelError::ModelNotFound => {
+                (StatusCode::NOT_FOUND, "model_not_found")
+            }
+            ModelError::Conflict(_) => (StatusCode::CONFLICT, "model_state_conflict"),
+            ModelError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_model_request"),
+            ModelError::Verification(_) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "model_verification_failed",
+            ),
+            ModelError::RuntimeUnavailable(_) => (StatusCode::CONFLICT, "runtime_unavailable"),
+            ModelError::Runtime(_) => (StatusCode::BAD_GATEWAY, "runtime_failed"),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        };
+        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            "the server could not complete the model operation".to_owned()
+        } else {
+            error.to_string()
+        };
+        Self {
+            status,
+            code,
+            message,
+            details: json!({}),
+        }
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
@@ -149,6 +181,9 @@ struct Features {
     event_replay: bool,
     websocket_events: bool,
     inference_token_streaming: bool,
+    model_management: bool,
+    hardware_discovery: bool,
+    durable_model_downloads: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +250,8 @@ pub fn router(state: AppState) -> Router {
         HeaderValue::from_static("http://tauri.localhost"),
         HeaderValue::from_static("http://127.0.0.1:1420"),
         HeaderValue::from_static("http://localhost:1420"),
+        HeaderValue::from_static("http://127.0.0.1:1430"),
+        HeaderValue::from_static("http://localhost:1430"),
     ];
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(allowed_origins))
@@ -229,9 +266,22 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/jobs/cleanup", post(cleanup_jobs))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
+        .route("/api/v1/jobs/{id}/pause", post(pause_job))
+        .route("/api/v1/jobs/{id}/resume", post(resume_job))
         .route("/api/v1/jobs/{id}/retry", post(retry_job))
         .route("/api/v1/events", get(list_events))
         .route("/api/v1/events/ws", get(events_socket))
+        .route("/api/v1/hardware", get(hardware))
+        .route("/api/v1/hardware/refresh", post(refresh_hardware))
+        .route("/api/v1/model-catalog", get(model_catalog))
+        .route("/api/v1/model-setup", get(model_setup))
+        .route("/api/v1/model-downloads", post(create_model_download))
+        .route("/api/v1/models", get(installed_models))
+        .route("/api/v1/models/export", get(export_inventory))
+        .route("/api/v1/models/default", put(set_default_model))
+        .route("/api/v1/models/{id}/load", post(load_model))
+        .route("/api/v1/models/{id}/unload", post(unload_model))
+        .route("/api/v1/models/{id}", delete(delete_model))
         .fallback(not_found)
         .layer(middleware::from_fn(check_protocol_header))
         .layer(cors)
@@ -263,12 +313,15 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<CapabilitiesRe
             event_replay: true,
             websocket_events: true,
             inference_token_streaming: false,
+            model_management: true,
+            hardware_discovery: true,
+            durable_model_downloads: true,
         },
         job_types: JobType::ALL
             .into_iter()
             .map(|job_type| JobTypeCapability {
                 job_type,
-                implemented: false,
+                implemented: job_type == JobType::ModelDownload,
             })
             .collect(),
     })
@@ -330,6 +383,122 @@ async fn cancel_job(
     Path(id): Path<String>,
 ) -> Result<Json<Job>, ApiError> {
     Ok(Json(state.store.cancel_job(&id).await?))
+}
+
+async fn pause_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Job>, ApiError> {
+    Ok(Json(state.store.pause_job(&id).await?))
+}
+
+async fn resume_job(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Job>, ApiError> {
+    Ok(Json(state.store.resume_job(&id).await?))
+}
+
+async fn hardware(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.models.hardware().await)
+}
+
+async fn refresh_hardware(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.models.refresh_hardware().await?))
+}
+
+async fn model_catalog(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.models.catalog().clone())
+}
+
+async fn model_setup(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.models.setup_plan().await?))
+}
+
+async fn create_model_download(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<DownloadSubmission>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(payload) = payload.map_err(|error| json_rejection(&error))?;
+    let (job, created) = state.models.submit_download(payload).await?;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(CreateJobResponse {
+            job,
+            duplicate: !created,
+        }),
+    ))
+}
+
+async fn installed_models(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.models.inventory().await?))
+}
+
+async fn export_inventory(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, ApiError> {
+    let inventory = state.models.inventory().await?;
+    Ok((
+        [(
+            "content-disposition",
+            "attachment; filename=\"tome-model-inventory.json\"",
+        )],
+        Json(inventory),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DefaultModelRequest {
+    model_id: String,
+}
+
+async fn set_default_model(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<DefaultModelRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(payload) = payload.map_err(|error| json_rejection(&error))?;
+    Ok(Json(state.models.set_default(&payload.model_id).await?))
+}
+
+async fn load_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.models.load(&id).await?))
+}
+
+async fn unload_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(state.models.unload(&id).await?))
+}
+
+#[derive(Debug, Deserialize)]
+struct DeleteModelRequest {
+    confirmation: String,
+}
+
+async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    payload: Result<Json<DeleteModelRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(payload) = payload.map_err(|error| json_rejection(&error))?;
+    if payload.confirmation != id {
+        return Err(ApiError::validation(
+            "confirmation must exactly match the model id",
+        ));
+    }
+    Ok(Json(state.models.delete(&id).await?))
 }
 
 async fn retry_job(

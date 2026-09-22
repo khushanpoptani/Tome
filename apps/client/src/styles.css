@@ -39,6 +39,227 @@ input {
     #f0eee7;
 }
 
+.connected-shell {
+  display: grid;
+  place-items: initial;
+  gap: 22px;
+  padding: 30px;
+}
+
+.connected-shell .connection-card,
+.model-workspace {
+  width: min(1180px, 100%);
+  margin: 0 auto;
+}
+
+.model-workspace {
+  padding: 28px;
+  border: 1px solid #d8d5ca;
+  border-radius: 20px;
+  background: rgba(255, 255, 252, 0.95);
+  box-shadow: 0 24px 60px rgba(55, 57, 48, 0.09);
+}
+
+.loading-panel {
+  color: #61625d;
+  text-align: center;
+}
+
+.workspace-header,
+.catalog-heading,
+.download-row,
+.model-row,
+.setup-strip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.workspace-header h2 {
+  margin: 4px 0;
+  font:
+    700 clamp(1.7rem, 4vw, 2.5rem) Georgia,
+    serif;
+}
+
+.workspace-header p,
+.setup-strip p,
+.model-row p,
+.catalog-card p {
+  margin: 0;
+  color: #676860;
+  line-height: 1.45;
+}
+
+.workspace-actions,
+.profile-buttons,
+.row-actions,
+.tag-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.live-state {
+  padding: 6px 9px;
+  border-radius: 999px;
+  color: #765f2f;
+  background: #f3ead4;
+  font-size: 0.7rem;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+.live-state.live {
+  color: #285c32;
+  background: #dbead7;
+}
+.live-state.offline {
+  color: #8b392d;
+  background: #f5dfda;
+}
+
+.hardware-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  margin: 24px 0;
+}
+
+.metric {
+  min-height: 112px;
+  padding: 14px;
+  border: 1px solid #dedbd1;
+  border-radius: 12px;
+  background: #f8f7f2;
+}
+.metric span,
+.metric small,
+.model-row small,
+.download-row small,
+.catalog-heading small {
+  display: block;
+  color: #777970;
+  font-size: 0.72rem;
+}
+.metric strong {
+  display: block;
+  margin: 8px 0;
+  font-size: 0.88rem;
+}
+.metric small {
+  overflow-wrap: anywhere;
+  line-height: 1.35;
+}
+
+.setup-strip {
+  padding: 18px;
+  border: 1px solid #cfdcc9;
+  border-radius: 13px;
+  background: #edf3ea;
+}
+.setup-strip p {
+  margin-top: 4px;
+  font-size: 0.8rem;
+}
+
+.model-section {
+  margin-top: 28px;
+}
+.model-section h3 {
+  margin: 0 0 12px;
+  font-family: Georgia, serif;
+  font-size: 1.25rem;
+}
+.download-row,
+.model-row {
+  padding: 14px 0;
+  border-top: 1px solid #e6e3da;
+}
+.download-row > div:first-child,
+.model-row > div:first-child {
+  min-width: 220px;
+  flex: 1;
+}
+.download-row small,
+.model-row small {
+  margin-top: 4px;
+}
+.download-row progress {
+  flex: 1;
+  min-width: 140px;
+  accent-color: #405d39;
+}
+.model-row p {
+  max-width: 65ch;
+  margin-top: 6px;
+  font-size: 0.78rem;
+}
+.empty-message {
+  padding: 20px;
+  border-radius: 12px;
+  color: #74756d;
+  background: #f5f4ef;
+  text-align: center;
+}
+
+.catalog-heading input {
+  width: min(330px, 100%);
+  margin: 0;
+}
+.catalog-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+.catalog-card {
+  padding: 18px;
+  border: 1px solid #dedbd1;
+  border-radius: 14px;
+  background: #fbfaf6;
+}
+.catalog-card h4 {
+  margin: 12px 0 7px;
+  font-size: 1rem;
+}
+.catalog-card p {
+  min-height: 55px;
+  font-size: 0.78rem;
+}
+.tag-row span {
+  padding: 4px 7px;
+  border-radius: 6px;
+  color: #466040;
+  background: #edf3ea;
+  font-size: 0.65rem;
+  font-weight: 750;
+}
+.catalog-card dl {
+  margin: 14px 0;
+}
+.catalog-card dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 5px 0;
+  border-top: 1px solid #ebe8df;
+  font-size: 0.72rem;
+}
+.catalog-card dt {
+  color: #777970;
+}
+.catalog-card dd {
+  margin: 0;
+  text-align: right;
+}
+button.danger {
+  color: #8b392d;
+  background: #fff;
+  border-color: #d9aaa2;
+}
+
 .connection-card {
   width: min(680px, 100%);
   padding: 32px;
@@ -235,5 +456,21 @@ footer {
 
   .actions {
     flex-direction: column-reverse;
+  }
+}
+
+@media (max-width: 900px) {
+  .hardware-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .catalog-grid {
+    grid-template-columns: 1fr;
+  }
+  .workspace-header,
+  .setup-strip,
+  .download-row,
+  .model-row {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

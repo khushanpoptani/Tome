@@ -37,7 +37,7 @@ pub struct CreateJob {
 
 #[derive(Debug, Clone)]
 pub struct JobStore {
-    pool: SqlitePool,
+    pub(crate) pool: SqlitePool,
     sender: broadcast::Sender<JobEvent>,
 }
 
@@ -205,6 +205,84 @@ impl JobStore {
         transaction.commit().await?;
         self.publish([event]);
         Ok(job)
+    }
+
+    pub async fn pause_job(&self, id: &str) -> Result<Job, StoreError> {
+        let now = now()?;
+        let mut transaction = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE jobs SET state = 'interrupted', updated_at = ?, finished_at = ?,
+             error_json = ? WHERE id = ? AND job_type = 'model_download'
+             AND state IN ('queued', 'running')",
+        )
+        .bind(&now)
+        .bind(&now)
+        .bind(
+            json!({ "code": "download_paused", "message": "download paused by user" }).to_string(),
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Err(StoreError::InvalidState);
+        }
+        let event = insert_event(
+            &mut transaction,
+            Some(id),
+            EventType::JobInterrupted,
+            json!({ "reason": "download_paused" }),
+            &now,
+        )
+        .await?;
+        let job = fetch_job_in(&mut transaction, id).await?;
+        transaction.commit().await?;
+        self.publish([event]);
+        Ok(job)
+    }
+
+    pub async fn resume_job(&self, id: &str) -> Result<Job, StoreError> {
+        let now = now()?;
+        let mut transaction = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE jobs SET state = 'queued', error_json = NULL, finished_at = NULL,
+             started_at = NULL, updated_at = ? WHERE id = ? AND job_type = 'model_download'
+             AND state = 'interrupted'",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed == 0 {
+            return Err(StoreError::InvalidState);
+        }
+        let event = insert_event(
+            &mut transaction,
+            Some(id),
+            EventType::JobQueued,
+            json!({ "reason": "download_resumed" }),
+            &now,
+        )
+        .await?;
+        let job = fetch_job_in(&mut transaction, id).await?;
+        transaction.commit().await?;
+        self.publish([event]);
+        Ok(job)
+    }
+
+    pub async fn resume_interrupted_downloads(&self) -> Result<u64, StoreError> {
+        let now = now()?;
+        let result = sqlx::query(
+            "UPDATE jobs SET state = 'queued', error_json = NULL, finished_at = NULL,
+             started_at = NULL, updated_at = ? WHERE job_type = 'model_download'
+             AND state = 'interrupted'
+             AND json_extract(error_json, '$.code') = 'server_restarted'",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn claim_next_queued(&self) -> Result<Option<Job>, StoreError> {
@@ -483,6 +561,22 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
             .await?;
         sqlx::query(
             "INSERT INTO tome_migrations (version, name, applied_at) VALUES (1, 'jobs', ?)",
+        )
+        .bind(now()?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+    }
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tome_migrations WHERE version = 2")
+        .fetch_one(pool)
+        .await?;
+    if applied == 0 {
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(include_str!("../migrations/0002_models.sql"))
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "INSERT INTO tome_migrations (version, name, applied_at) VALUES (2, 'models', ?)",
         )
         .bind(now()?)
         .execute(&mut *transaction)

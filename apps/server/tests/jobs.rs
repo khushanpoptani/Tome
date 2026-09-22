@@ -12,6 +12,7 @@ use tome_server::{
     api::{AppState, router},
     config::NetworkMode,
     model::{EventType, JobEvent, JobState, JobType},
+    models::ModelManager,
     store::{CreateJob, JobStore, StoreError},
 };
 use tower::ServiceExt;
@@ -25,6 +26,16 @@ fn request(key: &str) -> CreateJob {
         idempotency_key: key.to_owned(),
         job_type: JobType::Inference,
         input: json!({ "prompt": "not executed in Phase 1" }),
+        parent_job_id: None,
+        retry_of_job_id: None,
+    }
+}
+
+fn download_request(key: &str) -> CreateJob {
+    CreateJob {
+        idempotency_key: key.to_owned(),
+        job_type: JobType::ModelDownload,
+        input: json!({ "catalog_id": "fixture" }),
         parent_job_id: None,
         retry_of_job_id: None,
     }
@@ -111,6 +122,33 @@ async fn restart_preserves_progress_and_interrupts_running_only_once() {
 }
 
 #[tokio::test]
+async fn model_download_pause_resume_and_restart_requeue_are_durable() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("jobs.sqlite3");
+    let store = store_at(&path).await;
+    let (paused, _) = store
+        .create_job(download_request("paused-download"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.pause_job(&paused.id).await.unwrap().state,
+        JobState::Interrupted
+    );
+    assert_eq!(
+        store.resume_job(&paused.id).await.unwrap().state,
+        JobState::Queued
+    );
+    let claimed = store.claim_next_queued().await.unwrap().unwrap();
+    assert_eq!(claimed.id, paused.id);
+    store.update_progress(&claimed.id, 0.4).await.unwrap();
+    assert_eq!(store.recover_interrupted().await.unwrap(), 1);
+    assert_eq!(store.resume_interrupted_downloads().await.unwrap(), 1);
+    let resumed = store.get_job(&claimed.id).await.unwrap();
+    assert_eq!(resumed.state, JobState::Queued);
+    assert!((resumed.progress - 0.4).abs() < f64::EPSILON);
+}
+
+#[tokio::test]
 async fn terminal_jobs_survive_reopen_and_event_replay_uses_cursor() {
     let directory = TempDir::new().unwrap();
     let path = directory.path().join("jobs.sqlite3");
@@ -140,9 +178,13 @@ async fn terminal_jobs_survive_reopen_and_event_replay_uses_cursor() {
 async fn api_uses_structured_errors_and_reports_capabilities() {
     let directory = TempDir::new().unwrap();
     let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let models = ModelManager::open(store.clone(), directory.path())
+        .await
+        .unwrap();
     let app = router(AppState {
         store,
         network_mode: NetworkMode::Lan,
+        models,
     });
 
     let response = app
@@ -161,13 +203,13 @@ async fn api_uses_structured_errors_and_reports_capabilities() {
     assert_eq!(body["protocol"]["current"], 1);
     assert_eq!(body["network_mode"], "lan");
     assert_eq!(body["features"]["inference_token_streaming"], false);
-    assert!(
-        body["job_types"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|capability| capability["implemented"] == false)
-    );
+    let job_types = body["job_types"].as_array().unwrap();
+    assert!(job_types.iter().any(|capability| {
+        capability["job_type"] == "model_download" && capability["implemented"] == true
+    }));
+    assert!(job_types.iter().any(|capability| {
+        capability["job_type"] == "inference" && capability["implemented"] == false
+    }));
 
     let response = app
         .clone()
@@ -203,9 +245,68 @@ async fn api_uses_structured_errors_and_reports_capabilities() {
 }
 
 #[tokio::test]
+async fn model_management_api_exposes_hardware_catalog_setup_and_inventory() {
+    let directory = TempDir::new().unwrap();
+    let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let models = ModelManager::open(store.clone(), directory.path())
+        .await
+        .unwrap();
+    let app = router(AppState {
+        store,
+        network_mode: NetworkMode::Loopback,
+        models,
+    });
+
+    for (path, expected_key) in [
+        ("/api/v1/hardware", "schema_version"),
+        ("/api/v1/model-catalog", "catalog_version"),
+        ("/api/v1/model-setup", "profiles"),
+        ("/api/v1/models", "models"),
+        ("/api/v1/models/export", "models"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(body.get(expected_key).is_some(), "{path}");
+    }
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/model-downloads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "catalog_id": "qwen2.5-0.5b-instruct-q4-k-m",
+                        "idempotency_key": "license-required",
+                        "license_accepted": false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_model_request");
+}
+
+#[tokio::test]
 async fn websocket_replays_then_delivers_live_events() {
     let directory = TempDir::new().unwrap();
     let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let models = ModelManager::open(store.clone(), directory.path())
+        .await
+        .unwrap();
     let (existing, _) = store.create_job(request("before-connect")).await.unwrap();
     let existing_events = store.events_after(0, 10).await.unwrap();
     let first_cursor = existing_events[0].event_id;
@@ -215,6 +316,7 @@ async fn websocket_replays_then_delivers_live_events() {
     let app = router(AppState {
         store: store.clone(),
         network_mode: NetworkMode::Loopback,
+        models,
     });
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let (mut socket, _) = connect_async(format!(

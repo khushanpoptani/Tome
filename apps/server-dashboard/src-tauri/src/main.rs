@@ -591,9 +591,11 @@ fn remove_local_data_for_uninstall() -> Result<(), String> {
                 std::fs::remove_file(path).map_err(|error| error.to_string())?;
             }
         }
-        let temp = settings.data_directory.join("temp");
-        if temp.is_dir() {
-            std::fs::remove_dir_all(temp).map_err(|error| error.to_string())?;
+        for directory in ["temp", "models", "model-downloads", "model-trash"] {
+            let path = settings.data_directory.join(directory);
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).map_err(|error| error.to_string())?;
+            }
         }
     }
     if settings_path.is_file() {

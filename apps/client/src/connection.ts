@@ -28,6 +28,9 @@ export interface ServerCapabilities {
     event_replay: boolean;
     websocket_events: boolean;
     inference_token_streaming: boolean;
+    model_management?: boolean;
+    hardware_discovery?: boolean;
+    durable_model_downloads?: boolean;
   };
   job_types: Array<{ job_type: string; implemented: boolean }>;
 }

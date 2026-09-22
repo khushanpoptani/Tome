@@ -97,7 +97,7 @@ Terminal jobs are preserved across restarts. Queued jobs remain queued and can b
 
 Every state write and its event commit in one SQLite transaction. Events have monotonic integer IDs and are retained with the job until explicit or configured cleanup. Progress is in the inclusive range 0–1. Retention cleanup removes terminal jobs and their events; it never removes queued/running jobs.
 
-The server registers these future types: `inference`, `model_download`, `model_verification`, `model_load`, `model_unload`, `attachment_processing`, `ocr`, and `transcription`. All capability entries say `implemented: false`. The Phase 1 dispatcher claims them and records a `job_type_unimplemented` failure. No model or attachment work occurs.
+The server registers `inference`, `model_download`, `model_verification`, `model_load`, `model_unload`, `attachment_processing`, `ocr`, and `transcription`. Phase 2 implements model download/verification and the load/unload service boundary while preserving this job/event foundation; later job types still fail explicitly as unimplemented. See [Phase 2 model management](phase-2-model-management.md).
 
 At startup the server only discovers files prefixed `tome-job-` in its temporary directory. It emits `server.warning` and leaves them untouched. Ownership validation and deletion belong to the attachment phase.
 

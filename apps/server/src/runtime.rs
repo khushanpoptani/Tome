@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     api::{AppState, router},
     config::NetworkMode,
-    model::PROTOCOL_VERSION,
+    model::{JobState, JobType, PROTOCOL_VERSION},
+    models::ModelManager,
     network::{AddressKind, classify_address},
     store::{JobStore, StoreError},
 };
@@ -46,6 +47,7 @@ pub struct ServerHandle {
     tasks: Vec<JoinHandle<Result<(), std::io::Error>>>,
     worker: JoinHandle<Result<(), StoreError>>,
     store: JobStore,
+    models: ModelManager,
     pub listeners: Vec<std::net::SocketAddr>,
 }
 
@@ -72,6 +74,14 @@ impl ServerHandle {
         .format(&Rfc3339)?;
         store.cleanup_terminal_before(&retention_cutoff).await?;
         discover_orphans(&store, &config.temp_directory).await?;
+        let data_root = config
+            .database_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let models = ModelManager::open(store.clone(), data_root)
+            .await
+            .map_err(|error| RuntimeError::Store(StoreError::InvalidData(error.to_string())))?;
 
         let mut bound = Vec::with_capacity(config.listener_addresses.len());
         for address in &config.listener_addresses {
@@ -82,10 +92,15 @@ impl ServerHandle {
             .filter_map(|listener| listener.local_addr().ok())
             .collect::<Vec<_>>();
         let shutdown = CancellationToken::new();
-        let worker = tokio::spawn(run_job_dispatcher(store.clone(), shutdown.child_token()));
+        let worker = tokio::spawn(run_job_dispatcher(
+            store.clone(),
+            models.clone(),
+            shutdown.child_token(),
+        ));
         let app = router(AppState {
             store: store.clone(),
             network_mode: network_mode(&config.listener_addresses),
+            models: models.clone(),
         });
         let tasks = bound
             .into_iter()
@@ -109,6 +124,7 @@ impl ServerHandle {
             tasks,
             worker,
             store,
+            models,
             listeners,
         })
     }
@@ -124,6 +140,10 @@ impl ServerHandle {
             task.await??;
         }
         self.worker.await??;
+        self.models
+            .shutdown()
+            .await
+            .map_err(|error| RuntimeError::Store(StoreError::InvalidData(error.to_string())))?;
         self.store.recover_interrupted().await?;
         Ok(())
     }
@@ -170,6 +190,7 @@ fn network_mode(addresses: &[IpAddr]) -> NetworkMode {
 
 async fn run_job_dispatcher(
     store: JobStore,
+    models: ModelManager,
     shutdown: CancellationToken,
 ) -> Result<(), StoreError> {
     let mut interval = tokio::time::interval(Duration::from_millis(250));
@@ -178,10 +199,28 @@ async fn run_job_dispatcher(
             () = shutdown.cancelled() => return Ok(()),
             _ = interval.tick() => {
                 while let Some(job) = store.claim_next_queued().await? {
-                    store.fail_job(&job.id, json!({
-                        "code": "job_type_unimplemented",
-                        "message": format!("{} jobs are registered but not implemented in Phase 1", job.job_type),
-                    })).await?;
+                    if job.job_type == JobType::ModelDownload {
+                        match models.execute_download(&job).await {
+                            Ok(output) => {
+                                if store.get_job(&job.id).await?.state == JobState::Running {
+                                    store.complete_job(&job.id, output).await?;
+                                }
+                            }
+                            Err(error) => {
+                                if store.get_job(&job.id).await?.state == JobState::Running {
+                                    store.fail_job(&job.id, json!({
+                                        "code": "model_download_failed",
+                                        "message": error.to_string(),
+                                    })).await?;
+                                }
+                            }
+                        }
+                    } else {
+                        store.fail_job(&job.id, json!({
+                            "code": "job_type_unimplemented",
+                            "message": format!("{} jobs are not implemented in this phase", job.job_type),
+                        })).await?;
+                    }
                 }
             }
         }

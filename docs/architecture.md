@@ -8,13 +8,17 @@ Stage 0 establishes reproducible development and CI foundations. It intentionall
 
 Phase 1 adds the unauthenticated, single-user server connection and durable job foundation described in [Phase 1 server and jobs](phase-1-server.md). It deliberately does not add model management, inference, chat, attachments, OCR, transcription, or client-owned product storage. The registered job type names are protocol reservations, not implemented product behavior.
 
+## Phase 2 scope
+
+Phase 2 implements hardware/runtime discovery, a pinned model catalog, first-run setup, resumable verified model downloads, a durable model registry, a truthful runtime adapter boundary, and matching local/remote model-management UIs. `model_download` is now executed by the Phase 1 job engine. Model inference, prompts, chats, attachments, OCR execution, transcription execution, and resident-model scheduling remain out of scope. See [Phase 2 model management](phase-2-model-management.md).
+
 ## Approved stack
 
 - **Desktop client:** Tauri 2 with a React and TypeScript frontend.
 - **Server:** a Tauri 2 Windows desktop host and system tray wrapping a reusable Rust/Axum runtime for versioned HTTP and WebSocket APIs.
 - **Shared implementation language:** Rust for native client capabilities, server behavior, and future shared domain types.
 - **Server persistence:** SQLite stores durable jobs and their ordered, replayable event histories. Schema changes use explicit migrations.
-- **Model integration:** future model execution will sit behind an adapter compatible with local llama.cpp/Ollama-style runtimes. Stage 0 does not select or bundle a model runtime.
+- **Model integration:** the first production adapter detects an external `llama-server` executable and loads verified GGUF files on loopback. Tome does not simulate successful loads and does not bundle a runtime in Phase 2. Other catalog formats are explicitly catalog-only.
 - **Desktop-owned data:** the client remains the authority for local JSON chat data and compressed attachments. Formats and migration rules are deferred to the storage stage.
 
 ## Initial distribution targets

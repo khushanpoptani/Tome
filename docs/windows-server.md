@@ -6,6 +6,7 @@
 2. Approve the Windows administrator prompt. The installer is per-machine and adds Tome Server to the Start menu.
 3. The installer adds two inbound rules for TCP port 7331, scoped to the Tome Server executable. The LAN rule permits only `LocalSubnet` on Private networks; the Tailscale rule permits only `100.64.0.0/10`.
 4. Launch **Tome Server**. On first run, review the port, LAN access, Tailscale access, firewall permission, data directory, and launch-at-login choice, then select **Save and start Tome Server**.
+5. In **Model setup**, review detected hardware/runtime and install a compatible profile or manually choose an approved catalog model. A download remains resumable if the app or PC restarts.
 
 The development installer is unsigned, so Windows may show a publisher warning. Release signing is intentionally deferred.
 
@@ -28,6 +29,8 @@ Closing the dashboard window leaves the service running in the system tray. Open
 If Tailscale is unavailable, the dashboard distinguishes not installed, not signed in, and running without an assigned address. If a listener cannot bind, check for another process using the configured port and use **Restart** after correcting it. Firewall status and the active listener marker should both be healthy before troubleshooting a client.
 
 Changing the port or firewall option may trigger an administrator prompt so Tome can replace the restricted inbound rules.
+
+The model panel shows system memory, GPU data when Windows reports it, filesystem free space, llama.cpp availability, installed/default/loaded models, and durable download progress. GPU memory is shown as unknown when the Windows probe does not provide a reliable value. Install a reviewed `llama-server.exe` on `PATH` or configure `TOME_LLAMA_SERVER_PATH`; without it, downloads may be verified and registered but load/readiness remains explicitly unavailable.
 
 ## Uninstall or upgrade
 
