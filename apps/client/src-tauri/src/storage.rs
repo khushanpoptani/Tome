@@ -202,6 +202,25 @@ pub struct Message {
     pub parent_message_id: Option<String>,
     #[serde(default)]
     pub attachment_ids: Vec<String>,
+    #[serde(default)]
+    pub generation: Option<MessageGeneration>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageGeneration {
+    pub model_id: String,
+    pub model_artifact_sha256: Option<String>,
+    pub temperature: f64,
+    pub max_output_tokens: u32,
+    pub job_id: Option<String>,
+    pub state: String,
+    pub output_sequence: u64,
+    pub usage: Option<Value>,
+    pub completion_reason: Option<String>,
+    #[serde(default)]
+    pub context_warnings: Vec<String>,
+    pub retry_of_job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -319,6 +338,17 @@ pub struct PartialResponseMetadata {
     pub job_id: Option<String>,
     pub byte_length: u64,
     pub relative_path: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialResponse {
+    pub id: String,
+    pub chat_id: String,
+    pub message_id: String,
+    pub job_id: Option<String>,
+    pub content: String,
     pub updated_at: String,
 }
 
@@ -1161,6 +1191,201 @@ pub fn store_attachment(
     .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+pub fn save_partial_response(
+    storage: State<'_, ClientStorage>,
+    chat_id: String,
+    message_id: String,
+    job_id: Option<String>,
+    content: String,
+) -> std::result::Result<PartialResponse, String> {
+    save_partial_response_inner(&storage, &chat_id, &message_id, job_id.as_deref(), &content)
+        .map_err(|error| error.to_string())
+}
+
+fn save_partial_response_inner(
+    storage: &ClientStorage,
+    chat_id: &str,
+    message_id: &str,
+    job_id: Option<&str>,
+    content: &str,
+) -> Result<PartialResponse> {
+    validate_id(chat_id)?;
+    validate_id(message_id)?;
+    if let Some(id) = job_id {
+        validate_id(id)?;
+    }
+    if content.len() > MAX_IMPORT_BYTES {
+        return Err(StorageError::Invalid("partial response size"));
+    }
+    let _lock = storage.gate.lock().expect("storage lock poisoned");
+    let index_path = storage.safe_path("partials/index.json")?;
+    let mut diagnostics = Vec::new();
+    let mut index = storage.load_or_default_validated::<PartialResponseStore>(
+        &index_path,
+        "partial responses",
+        PartialResponseStore::default,
+        &mut diagnostics,
+        validate_partial_store,
+    );
+    let previous = index
+        .responses
+        .iter()
+        .find(|item| item.chat_id == chat_id && item.message_id == message_id)
+        .cloned();
+    let response_id = previous
+        .as_ref()
+        .map_or_else(|| Uuid::now_v7().to_string(), |item| item.id.clone());
+    let checkpoint_id = Uuid::now_v7();
+    let relative_path = format!("partials/content/{response_id}-{checkpoint_id}.txt");
+    atomic_write_bytes(&storage.safe_path(&relative_path)?, content.as_bytes())?;
+    let timestamp = now();
+    let metadata = PartialResponseMetadata {
+        id: response_id.clone(),
+        chat_id: chat_id.to_owned(),
+        message_id: message_id.to_owned(),
+        job_id: job_id.map(str::to_owned),
+        byte_length: content.len() as u64,
+        relative_path: relative_path.clone(),
+        updated_at: timestamp.clone(),
+    };
+    index
+        .responses
+        .retain(|item| !(item.chat_id == chat_id && item.message_id == message_id));
+    index.responses.push(metadata);
+    atomic_write_json(&index_path, &index)?;
+    if let Some(previous) = previous
+        && previous.relative_path != relative_path
+    {
+        remove_managed_file(storage, &previous.relative_path)?;
+    }
+    Ok(PartialResponse {
+        id: response_id,
+        chat_id: chat_id.to_owned(),
+        message_id: message_id.to_owned(),
+        job_id: job_id.map(str::to_owned),
+        content: content.to_owned(),
+        updated_at: timestamp,
+    })
+}
+
+#[tauri::command]
+pub fn load_partial_responses(
+    storage: State<'_, ClientStorage>,
+    chat_id: String,
+) -> std::result::Result<Vec<PartialResponse>, String> {
+    validate_id(&chat_id).map_err(|error| error.to_string())?;
+    let _lock = storage.gate.lock().expect("storage lock poisoned");
+    let mut diagnostics = Vec::new();
+    let index = storage.load_or_default_validated::<PartialResponseStore>(
+        &storage
+            .safe_path("partials/index.json")
+            .map_err(|error| error.to_string())?,
+        "partial responses",
+        PartialResponseStore::default,
+        &mut diagnostics,
+        validate_partial_store,
+    );
+    let mut responses = Vec::new();
+    for item in index
+        .responses
+        .into_iter()
+        .filter(|item| item.chat_id == chat_id)
+    {
+        let bytes = fs::read(
+            storage
+                .safe_path(&item.relative_path)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        if bytes.len() as u64 != item.byte_length || bytes.len() > MAX_IMPORT_BYTES {
+            return Err("partial response content is invalid".to_owned());
+        }
+        let content = String::from_utf8(bytes)
+            .map_err(|_| "partial response content is not UTF-8".to_owned())?;
+        responses.push(PartialResponse {
+            id: item.id,
+            chat_id: item.chat_id,
+            message_id: item.message_id,
+            job_id: item.job_id,
+            content,
+            updated_at: item.updated_at,
+        });
+    }
+    Ok(responses)
+}
+
+#[tauri::command]
+pub fn clear_partial_response(
+    storage: State<'_, ClientStorage>,
+    chat_id: String,
+    message_id: String,
+) -> std::result::Result<(), String> {
+    validate_id(&chat_id).map_err(|error| error.to_string())?;
+    validate_id(&message_id).map_err(|error| error.to_string())?;
+    let _lock = storage.gate.lock().expect("storage lock poisoned");
+    let index_path = storage
+        .safe_path("partials/index.json")
+        .map_err(|error| error.to_string())?;
+    let mut diagnostics = Vec::new();
+    let mut index = storage.load_or_default_validated::<PartialResponseStore>(
+        &index_path,
+        "partial responses",
+        PartialResponseStore::default,
+        &mut diagnostics,
+        validate_partial_store,
+    );
+    let removed = index
+        .responses
+        .iter()
+        .filter(|item| item.chat_id == chat_id && item.message_id == message_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    index
+        .responses
+        .retain(|item| !(item.chat_id == chat_id && item.message_id == message_id));
+    for item in removed {
+        remove_managed_file(&storage, &item.relative_path).map_err(|error| error.to_string())?;
+    }
+    atomic_write_json(&index_path, &index).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn write_interaction_export(
+    storage: State<'_, ClientStorage>,
+    destination: String,
+    content: String,
+) -> std::result::Result<String, String> {
+    if content.len() > MAX_IMPORT_BYTES {
+        return Err("interaction export exceeds 16 MiB".to_owned());
+    }
+    let destination = Path::new(&destination);
+    if !destination.is_absolute() || destination.file_name().is_none() {
+        return Err("invalid export destination".to_owned());
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| "invalid export destination".to_owned())?;
+    let canonical_parent = fs::canonicalize(parent).map_err(|error| error.to_string())?;
+    if canonical_parent.starts_with(&storage.root) {
+        return Err("export destination must be outside managed Tome data".to_owned());
+    }
+    let final_path = canonical_parent.join(
+        destination
+            .file_name()
+            .ok_or_else(|| "invalid export file name".to_owned())?,
+    );
+    let sanitized = sanitize_export_text(&content);
+    let temporary = canonical_parent.join(format!(".tome-export-{}.tmp", Uuid::now_v7()));
+    atomic_write_bytes(&temporary, sanitized.as_bytes()).map_err(|error| error.to_string())?;
+    if final_path.exists() {
+        fs::remove_file(&final_path).map_err(|error| error.to_string())?;
+    }
+    fs::rename(&temporary, &final_path).map_err(|error| error.to_string())?;
+    sync_directory(&canonical_parent);
+    Ok(final_path.display().to_string())
+}
+
 fn store_attachment_inner(
     storage: &ClientStorage,
     original_name: String,
@@ -1392,6 +1617,17 @@ fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_opaque_reference(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.contains(['/', '\\', '\0'])
+        || matches!(value, "." | "..")
+    {
+        return Err(StorageError::Invalid("opaque reference"));
+    }
+    Ok(())
+}
+
 fn validate_title(title: &str) -> Result<()> {
     let title = title.trim();
     if title.is_empty() || title.len() > 200 || title.contains('\0') {
@@ -1455,6 +1691,7 @@ fn validate_profile(profile: &ServerProfile) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_chat(chat: &Chat) -> Result<()> {
     if chat.schema_version != SCHEMA_VERSION {
         return Err(StorageError::Unsupported {
@@ -1478,7 +1715,7 @@ fn validate_chat(chat: &Chat) -> Result<()> {
         validate_id(id)?;
     }
     if let Some(id) = &chat.model_id {
-        validate_id(id)?;
+        validate_opaque_reference(id)?;
     }
     let mut ids = HashSet::new();
     for message in &chat.messages {
@@ -1495,6 +1732,47 @@ fn validate_chat(chat: &Chat) -> Result<()> {
         }
         for id in &message.attachment_ids {
             validate_id(id)?;
+        }
+        if let Some(generation) = &message.generation {
+            validate_opaque_reference(&generation.model_id)?;
+            if let Some(hash) = &generation.model_artifact_sha256
+                && (hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            {
+                return Err(StorageError::Invalid("model artifact hash"));
+            }
+            if !generation.temperature.is_finite()
+                || !(0.0..=2.0).contains(&generation.temperature)
+                || generation.max_output_tokens == 0
+                || generation.max_output_tokens > 4096
+            {
+                return Err(StorageError::Invalid("generation settings"));
+            }
+            for id in [&generation.job_id, &generation.retry_of_job_id]
+                .into_iter()
+                .flatten()
+            {
+                validate_id(id)?;
+            }
+            if generation.state.len() > 32
+                || generation
+                    .completion_reason
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 64)
+                || generation.context_warnings.len() > 64
+                || generation
+                    .context_warnings
+                    .iter()
+                    .any(|value| value.len() > 1024)
+            {
+                return Err(StorageError::Invalid("generation metadata"));
+            }
+            if generation
+                .usage
+                .as_ref()
+                .is_some_and(contains_sensitive_fields)
+            {
+                return Err(StorageError::Invalid("credential-like generation field"));
+            }
         }
     }
     for reference in &chat.job_references {
@@ -1550,7 +1828,7 @@ fn validate_settings(settings: &Settings) -> Result<()> {
     for (id, model_id) in &settings.default_models {
         validate_id(id)?;
         if !model_id.is_empty() {
-            validate_id(model_id)?;
+            validate_opaque_reference(model_id)?;
         }
     }
     Ok(())
@@ -1895,6 +2173,31 @@ fn redact_sensitive(value: &mut Value) {
     }
 }
 
+fn sanitize_export_text(content: &str) -> String {
+    content
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if lower.contains("authorization:") || lower.contains("bearer ") {
+                "[redacted credential]".to_owned()
+            } else {
+                let mut sanitized = line.to_owned();
+                for key in ["token=", "access_token=", "signature=", "x-amz-signature="] {
+                    if let Some(start) = sanitized.to_ascii_lowercase().find(key) {
+                        let value_start = start + key.len();
+                        let value_end = sanitized[value_start..]
+                            .find(['&', ' ', '\"'])
+                            .map_or(sanitized.len(), |offset| value_start + offset);
+                        sanitized.replace_range(value_start..value_end, "[redacted]");
+                    }
+                }
+                sanitized
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn contains_sensitive_fields(value: &Value) -> bool {
     match value {
         Value::Object(object) => object
@@ -2014,6 +2317,58 @@ mod tests {
     }
 
     #[test]
+    fn partial_response_checkpoint_is_atomic_and_reusable() {
+        let (_temporary, storage) = storage();
+        let chat = create_chat_inner(&storage, "Streaming".into(), None).unwrap();
+        let message_id = Uuid::now_v7().to_string();
+        let job_id = Uuid::now_v7().to_string();
+        let first =
+            save_partial_response_inner(&storage, &chat.id, &message_id, Some(&job_id), "partial")
+                .unwrap();
+        let second = save_partial_response_inner(
+            &storage,
+            &chat.id,
+            &message_id,
+            Some(&job_id),
+            "partial response",
+        )
+        .unwrap();
+        assert_eq!(first.id, second.id);
+        let index: PartialResponseStore = recover_json_validated(
+            &storage.safe_path("partials/index.json").unwrap(),
+            "partial responses",
+            validate_partial_store,
+        )
+        .unwrap();
+        assert_eq!(index.responses.len(), 1);
+        assert_eq!(
+            fs::read_to_string(
+                storage
+                    .safe_path(&index.responses[0].relative_path)
+                    .unwrap()
+            )
+            .unwrap(),
+            "partial response"
+        );
+        assert_eq!(
+            fs::read_dir(storage.safe_path("partials/content").unwrap())
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn interaction_export_text_redacts_credentials_and_signed_queries() {
+        let sanitized = sanitize_export_text(
+            "safe\nAuthorization: Bearer secret\nhttps://example.invalid/?token=secret&ok=1",
+        );
+        assert!(sanitized.contains("safe"));
+        assert!(sanitized.contains("token=[redacted]&ok=1"));
+        assert!(!sanitized.contains("Bearer secret"));
+    }
+
+    #[test]
     fn duplicate_message_ids_are_rejected() {
         let id = Uuid::now_v7().to_string();
         let timestamp = now();
@@ -2024,6 +2379,7 @@ mod tests {
             created_at: timestamp.clone(),
             parent_message_id: None,
             attachment_ids: Vec::new(),
+            generation: None,
         };
         let chat = Chat {
             schema_version: SCHEMA_VERSION,

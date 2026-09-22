@@ -74,6 +74,12 @@ pnpm --filter @tome/client test
 
 The browser-only Vite preview intentionally cannot persist client records; use `pnpm dev:client` to exercise native storage, import/export, and delete-all behavior. See [Phase 3 client storage](phase-3-client-storage.md) for the data layout and manual validation checklist.
 
+## Phase 4 text inference
+
+The Windows dashboard package includes reviewed llama.cpp `b10964` CPU files below `apps/server-dashboard/src-tauri/runtime/`. Do not replace a runtime file independently: update the pinned build, source revision, archive provenance, all file hashes, and licenses together. Packaged Windows discovery verifies the manifest before use. `TOME_LLAMA_SERVER_PATH` is an advanced development/operator override and is not required for a normal installation.
+
+Inference uses the Phase 1 queue and one execution lane. Context counting calls the managed runtime's template and tokenizer endpoints before generation. CI unit tests use deterministic tokenizer logic and never download model weights. A real-model smoke test is manual because multi-gigabyte weights and volatile downloads are prohibited. See [Phase 4 text chat and Context Manager V1](phase-4-text-chat.md).
+
 ## Distribution builds
 
 Build the Apple Silicon DMG on macOS:

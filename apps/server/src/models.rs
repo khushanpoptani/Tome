@@ -19,7 +19,7 @@ use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     fs,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     sync::{Mutex, RwLock},
 };
@@ -140,7 +140,19 @@ pub struct ModelManager {
     trash_root: Arc<PathBuf>,
     hardware: Arc<RwLock<HardwareCapabilities>>,
     client: Client,
-    processes: Arc<Mutex<HashMap<String, Child>>>,
+    processes: Arc<Mutex<HashMap<String, RuntimeProcess>>>,
+}
+
+struct RuntimeProcess {
+    child: Child,
+    base_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InferenceRuntime {
+    pub model: InstalledModel,
+    pub base_url: String,
+    pub runtime_version: String,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -488,7 +500,27 @@ impl ModelManager {
     pub async fn load(&self, model_id: &str) -> Result<InstalledModel, ModelError> {
         let model = self.model(model_id).await?;
         if model.loaded {
-            return Ok(model);
+            let alive = {
+                let mut processes = self.processes.lock().await;
+                let alive = processes.get_mut(model_id).is_some_and(|process| {
+                    process
+                        .child
+                        .try_wait()
+                        .is_ok_and(|status| status.is_none())
+                });
+                if !alive {
+                    processes.remove(model_id);
+                }
+                alive
+            };
+            if alive {
+                return Ok(model);
+            }
+            sqlx::query("UPDATE model_artifacts SET loaded = 0, updated_at = ? WHERE id = ?")
+                .bind(now()?)
+                .bind(model_id)
+                .execute(&self.store.pool)
+                .await?;
         }
         if model.compatibility_state != "compatible" {
             return Err(ModelError::Conflict(model.compatibility_reason));
@@ -500,11 +532,11 @@ impl ModelManager {
             .executable
             .ok_or_else(|| ModelError::RuntimeUnavailable(hardware.runtime.llama_cpp.reason))?;
         let adapter = LlamaCppAdapter { executable };
-        let child = adapter.start(&model, &self.client).await?;
+        let process = adapter.start(&model, &self.client).await?;
         self.processes
             .lock()
             .await
-            .insert(model_id.to_owned(), child);
+            .insert(model_id.to_owned(), process);
         sqlx::query("UPDATE model_artifacts SET loaded = 1, last_loaded_at = ?, updated_at = ? WHERE id = ?")
             .bind(now()?).bind(now()?).bind(model_id).execute(&self.store.pool).await?;
         self.model(model_id).await
@@ -517,9 +549,9 @@ impl ModelManager {
                 "model is actively referenced and cannot be unloaded".to_owned(),
             ));
         }
-        if let Some(mut child) = self.processes.lock().await.remove(model_id) {
-            child.kill().await?;
-            let _ = child.wait().await;
+        if let Some(mut process) = self.processes.lock().await.remove(model_id) {
+            process.child.kill().await?;
+            let _ = process.child.wait().await;
         }
         sqlx::query("UPDATE model_artifacts SET loaded = 0, updated_at = ? WHERE id = ?")
             .bind(now()?)
@@ -578,9 +610,9 @@ impl ModelManager {
 
     pub async fn shutdown(&self) -> Result<(), ModelError> {
         let mut processes = self.processes.lock().await;
-        for child in processes.values_mut() {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        for process in processes.values_mut() {
+            let _ = process.child.kill().await;
+            let _ = process.child.wait().await;
         }
         processes.clear();
         sqlx::query("UPDATE model_artifacts SET loaded = 0, updated_at = ? WHERE loaded != 0")
@@ -588,6 +620,99 @@ impl ModelManager {
             .execute(&self.store.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn model_for_inference(&self, model_id: &str) -> Result<InstalledModel, ModelError> {
+        let model = self.model(model_id).await?;
+        if model.verification_state != "verified"
+            || model.compatibility_state != "compatible"
+            || !model
+                .capabilities
+                .iter()
+                .any(|capability| capability == "text_output")
+        {
+            return Err(ModelError::Conflict(
+                "inference requires a verified, compatible text-output model".to_owned(),
+            ));
+        }
+        let canonical = fs::canonicalize(&model.local_path).await?;
+        self.assert_contained(&canonical, &self.model_root, true)
+            .await?;
+        Ok(model)
+    }
+
+    pub async fn runtime_for_inference(
+        &self,
+        model_id: &str,
+    ) -> Result<InferenceRuntime, ModelError> {
+        let _model = self.model_for_inference(model_id).await?;
+        let loaded_ids = self
+            .processes
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for loaded_id in loaded_ids {
+            if loaded_id != model_id {
+                let loaded = self.model(&loaded_id).await?;
+                if loaded.in_use_count > 0 {
+                    return Err(ModelError::Conflict(
+                        "another model is currently generating; retry when it finishes".to_owned(),
+                    ));
+                }
+                self.unload(&loaded_id).await?;
+            }
+        }
+        if !self.processes.lock().await.contains_key(model_id) {
+            self.load(model_id).await?;
+        }
+        let base_url = self
+            .processes
+            .lock()
+            .await
+            .get(model_id)
+            .map(|process| process.base_url.clone())
+            .ok_or_else(|| {
+                ModelError::Runtime("managed runtime disappeared after loading".to_owned())
+            })?;
+        let runtime_version = self
+            .hardware()
+            .await
+            .runtime
+            .llama_cpp
+            .version
+            .unwrap_or_else(|| "unknown".to_owned());
+        Ok(InferenceRuntime {
+            model: self.model(model_id).await?,
+            base_url,
+            runtime_version,
+        })
+    }
+
+    pub async fn mark_in_use(&self, model_id: &str, delta: i32) -> Result<(), ModelError> {
+        let changed = sqlx::query(
+            "UPDATE model_artifacts SET in_use_count = in_use_count + ?, updated_at = ?
+             WHERE id = ? AND in_use_count + ? >= 0",
+        )
+        .bind(delta)
+        .bind(now()?)
+        .bind(model_id)
+        .bind(delta)
+        .execute(&self.store.pool)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(ModelError::Conflict(
+                "invalid model use-count transition".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn http_client(&self) -> Client {
+        self.client.clone()
     }
 
     async fn reconcile(&self) -> Result<(), ModelError> {
@@ -804,7 +929,11 @@ fn compatibility(entry: &CatalogEntry, hardware: &HardwareCapabilities) -> (&'st
 }
 
 trait RuntimeAdapter {
-    async fn start(&self, model: &InstalledModel, client: &Client) -> Result<Child, ModelError>;
+    async fn start(
+        &self,
+        model: &InstalledModel,
+        client: &Client,
+    ) -> Result<RuntimeProcess, ModelError>;
 }
 
 struct LlamaCppAdapter {
@@ -812,9 +941,14 @@ struct LlamaCppAdapter {
 }
 
 impl RuntimeAdapter for LlamaCppAdapter {
-    async fn start(&self, model: &InstalledModel, client: &Client) -> Result<Child, ModelError> {
+    async fn start(
+        &self,
+        model: &InstalledModel,
+        client: &Client,
+    ) -> Result<RuntimeProcess, ModelError> {
         let port = reserve_loopback_port()?;
-        let mut child = Command::new(&self.executable)
+        let mut command = Command::new(&self.executable);
+        command
             .args([
                 "-m",
                 &model.local_path,
@@ -825,12 +959,23 @@ impl RuntimeAdapter for LlamaCppAdapter {
                 "--no-webui",
             ])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()?;
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.as_std_mut().creation_flags(0x0800_0000);
+        }
+        let mut child = command.spawn()?;
         let health_url = format!("http://127.0.0.1:{port}/health");
-        for _ in 0..40 {
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(log_runtime_output(stdout, "stdout"));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            tokio::spawn(log_runtime_output(stderr, "stderr"));
+        }
+        for _ in 0..480 {
             if child.try_wait()?.is_some() {
                 return Err(ModelError::Runtime(
                     "llama-server exited before the model became ready".to_owned(),
@@ -843,15 +988,42 @@ impl RuntimeAdapter for LlamaCppAdapter {
                 .await
                 .is_ok_and(|response| response.status().is_success())
             {
-                return Ok(child);
+                return Ok(RuntimeProcess {
+                    child,
+                    base_url: format!("http://127.0.0.1:{port}"),
+                });
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         let _ = child.kill().await;
         Err(ModelError::Runtime(
-            "llama-server did not become healthy within ten seconds".to_owned(),
+            "llama-server did not become healthy within 120 seconds".to_owned(),
         ))
     }
+}
+
+async fn log_runtime_output<R>(reader: R, stream: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut lines = BufReader::new(reader).lines();
+    let mut emitted = 0_u32;
+    while emitted < 200 {
+        match lines.next_line().await {
+            Ok(Some(mut line)) => {
+                if line.len() > 512 {
+                    line.truncate(512);
+                }
+                if line.to_ascii_lowercase().contains("authorization") {
+                    "[redacted runtime log line]".clone_into(&mut line);
+                }
+                tracing::debug!(runtime_stream = stream, line, "llama.cpp");
+                emitted += 1;
+            }
+            Ok(None) | Err(_) => return,
+        }
+    }
+    tracing::debug!(runtime_stream = stream, "llama.cpp log limit reached");
 }
 
 async fn verify_file(path: &Path, entry: &CatalogEntry) -> Result<(), ModelError> {

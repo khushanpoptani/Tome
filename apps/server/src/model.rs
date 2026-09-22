@@ -159,6 +159,24 @@ pub enum EventType {
     JobCancelled,
     #[serde(rename = "job.interrupted")]
     JobInterrupted,
+    #[serde(rename = "inference.context_prepared")]
+    InferenceContextPrepared,
+    #[serde(rename = "inference.generation_started")]
+    InferenceGenerationStarted,
+    #[serde(rename = "inference.text_delta")]
+    InferenceTextDelta,
+    #[serde(rename = "inference.output_checkpoint")]
+    InferenceOutputCheckpoint,
+    #[serde(rename = "inference.usage_updated")]
+    InferenceUsageUpdated,
+    #[serde(rename = "inference.stopped")]
+    InferenceStopped,
+    #[serde(rename = "inference.completed")]
+    InferenceCompleted,
+    #[serde(rename = "inference.failed")]
+    InferenceFailed,
+    #[serde(rename = "inference.interrupted")]
+    InferenceInterrupted,
     #[serde(rename = "server.warning")]
     ServerWarning,
 }
@@ -174,6 +192,15 @@ impl fmt::Display for EventType {
             Self::JobFailed => "job.failed",
             Self::JobCancelled => "job.cancelled",
             Self::JobInterrupted => "job.interrupted",
+            Self::InferenceContextPrepared => "inference.context_prepared",
+            Self::InferenceGenerationStarted => "inference.generation_started",
+            Self::InferenceTextDelta => "inference.text_delta",
+            Self::InferenceOutputCheckpoint => "inference.output_checkpoint",
+            Self::InferenceUsageUpdated => "inference.usage_updated",
+            Self::InferenceStopped => "inference.stopped",
+            Self::InferenceCompleted => "inference.completed",
+            Self::InferenceFailed => "inference.failed",
+            Self::InferenceInterrupted => "inference.interrupted",
             Self::ServerWarning => "server.warning",
         };
         formatter.write_str(value)
@@ -193,6 +220,15 @@ impl FromStr for EventType {
             "job.failed" => Ok(Self::JobFailed),
             "job.cancelled" => Ok(Self::JobCancelled),
             "job.interrupted" => Ok(Self::JobInterrupted),
+            "inference.context_prepared" => Ok(Self::InferenceContextPrepared),
+            "inference.generation_started" => Ok(Self::InferenceGenerationStarted),
+            "inference.text_delta" => Ok(Self::InferenceTextDelta),
+            "inference.output_checkpoint" => Ok(Self::InferenceOutputCheckpoint),
+            "inference.usage_updated" => Ok(Self::InferenceUsageUpdated),
+            "inference.stopped" => Ok(Self::InferenceStopped),
+            "inference.completed" => Ok(Self::InferenceCompleted),
+            "inference.failed" => Ok(Self::InferenceFailed),
+            "inference.interrupted" => Ok(Self::InferenceInterrupted),
             "server.warning" => Ok(Self::ServerWarning),
             _ => Err(format!("unknown event type: {value}")),
         }

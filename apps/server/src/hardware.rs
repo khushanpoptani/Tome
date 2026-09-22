@@ -1,8 +1,14 @@
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sysinfo::System;
-use tokio::{process::Command, time::timeout};
+use tokio::{fs, io::AsyncReadExt, process::Command, time::timeout};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HardwareCapabilities {
@@ -100,14 +106,24 @@ pub async fn detect(model_root: &Path) -> HardwareCapabilities {
 }
 
 async fn detect_llama_runtime() -> RuntimeAvailability {
-    let explicit = std::env::var_os("TOME_LLAMA_SERVER_PATH").map(std::path::PathBuf::from);
-    let executable = explicit.unwrap_or_else(|| {
+    let explicit = std::env::var_os("TOME_LLAMA_SERVER_PATH").map(PathBuf::from);
+    let bundled = explicit.is_none().then(bundled_runtime_path).flatten();
+    let bundled_selected = bundled.is_some();
+    let executable = explicit.or(bundled).unwrap_or_else(|| {
         if cfg!(windows) {
             "llama-server.exe".into()
         } else {
             "llama-server".into()
         }
     });
+    if bundled_selected && let Err(reason) = verify_bundled_runtime(&executable).await {
+        return RuntimeAvailability {
+            available: false,
+            executable: Some(executable.display().to_string()),
+            version: Some("b10964".to_owned()),
+            reason: format!("Bundled llama.cpp verification failed: {reason}"),
+        };
+    }
     let result = timeout(
         Duration::from_secs(3),
         Command::new(&executable)
@@ -125,12 +141,24 @@ async fn detect_llama_runtime() -> RuntimeAvailability {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             let version = (!stdout.is_empty())
                 .then_some(stdout)
-                .or_else(|| (!stderr.is_empty()).then_some(stderr));
+                .or_else(|| (!stderr.is_empty()).then_some(stderr))
+                .map(|mut value| {
+                    if value.len() > 512 {
+                        value.truncate(512);
+                    }
+                    value
+                });
             RuntimeAvailability {
                 available: true,
                 executable: Some(executable.display().to_string()),
                 version,
-                reason: "A llama.cpp server executable responded successfully.".to_owned(),
+                reason: if bundled_selected {
+                    "The bundled, pinned llama.cpp b10964 CPU runtime was verified and responded successfully.".to_owned()
+                } else if std::env::var_os("TOME_LLAMA_SERVER_PATH").is_some() {
+                    "The advanced operator llama.cpp override responded successfully; its reported version is shown above.".to_owned()
+                } else {
+                    "A llama.cpp server executable on PATH responded successfully.".to_owned()
+                },
             }
         }
         Ok(Ok(output)) => RuntimeAvailability {
@@ -152,6 +180,73 @@ async fn detect_llama_runtime() -> RuntimeAvailability {
             reason: "The llama.cpp version probe timed out after three seconds.".to_owned(),
         },
     }
+}
+
+fn bundled_runtime_path() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    [
+        directory.join("runtime/llama-server.exe"),
+        directory.join("resources/runtime/llama-server.exe"),
+    ]
+    .into_iter()
+    .find(|candidate| candidate.is_file())
+}
+
+#[derive(Deserialize)]
+struct RuntimeManifest {
+    build: String,
+    source_revision: String,
+    files: BTreeMap<String, String>,
+}
+
+async fn verify_bundled_runtime(executable: &Path) -> Result<(), String> {
+    let directory = executable
+        .parent()
+        .ok_or_else(|| "runtime executable has no parent directory".to_owned())?;
+    let manifest_path = directory.join("manifest.json");
+    let manifest_bytes = fs::read(&manifest_path)
+        .await
+        .map_err(|_| "runtime manifest is missing".to_owned())?;
+    let manifest: RuntimeManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|_| "runtime manifest is malformed".to_owned())?;
+    if manifest.build != "b10964"
+        || manifest.source_revision != "b29c606e28a01b1bc8c1351026a0fa6e616bf6c4"
+    {
+        return Err("runtime manifest identity does not match the reviewed build".to_owned());
+    }
+    for (name, expected) in manifest.files {
+        if name.is_empty()
+            || name.contains(['/', '\\', '\0'])
+            || matches!(name.as_str(), "." | "..")
+        {
+            return Err("runtime manifest contains an unsafe file name".to_owned());
+        }
+        let path = directory.join(&name);
+        let mut file = fs::File::open(&path)
+            .await
+            .map_err(|_| format!("required runtime file {name} is missing"))?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            let count = file
+                .read(&mut buffer)
+                .await
+                .map_err(|_| format!("could not read runtime file {name}"))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = format!("{:x}", hasher.finalize());
+        if actual != expected {
+            return Err(format!("runtime file {name} failed SHA-256 verification"));
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::unused_async)]
@@ -244,4 +339,16 @@ fn cpu_features() -> Vec<String> {
     #[cfg(target_arch = "aarch64")]
     features.push("aarch64".to_owned());
     features
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checked_in_windows_runtime_matches_reviewed_manifest() {
+        let executable = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../server-dashboard/src-tauri/runtime/llama-server.exe");
+        verify_bundled_runtime(&executable).await.unwrap();
+    }
 }

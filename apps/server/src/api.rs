@@ -4,7 +4,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{
-        Path, Query, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Query, State, WebSocketUpgrade,
         rejection::{JsonRejection, QueryRejection},
         ws::Message,
     },
@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::{
     config::NetworkMode,
+    inference::{InferenceError, InferenceRequest, InferenceService},
     model::{API_VERSION, Job, JobEvent, JobState, JobType, PROTOCOL_VERSION},
     models::{DownloadSubmission, ModelError, ModelManager},
     store::{CreateJob, JobStore, StoreError},
@@ -116,6 +117,45 @@ impl From<ModelError> for ApiError {
         };
         let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
             "the server could not complete the model operation".to_owned()
+        } else {
+            error.to_string()
+        };
+        Self {
+            status,
+            code,
+            message,
+            details: json!({}),
+        }
+    }
+}
+
+impl From<InferenceError> for ApiError {
+    fn from(error: InferenceError) -> Self {
+        let (status, code) = match &error {
+            InferenceError::Invalid(_) => (StatusCode::BAD_REQUEST, "invalid_inference_request"),
+            InferenceError::ContextOverflow(_) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "context_overflow")
+            }
+            InferenceError::Model(ModelError::ModelNotFound) => {
+                (StatusCode::NOT_FOUND, "model_not_found")
+            }
+            InferenceError::Model(ModelError::Conflict(_)) => {
+                (StatusCode::CONFLICT, "model_not_ready")
+            }
+            InferenceError::Model(ModelError::RuntimeUnavailable(_)) => {
+                (StatusCode::CONFLICT, "runtime_unavailable")
+            }
+            InferenceError::Runtime(_) => (StatusCode::BAD_GATEWAY, "runtime_failed"),
+            InferenceError::Store(StoreError::IdempotencyConflict) => {
+                (StatusCode::CONFLICT, "idempotency_conflict")
+            }
+            InferenceError::Store(StoreError::NotFound) => {
+                (StatusCode::NOT_FOUND, "inference_not_found")
+            }
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        };
+        let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
+            "the server could not complete the inference operation".to_owned()
         } else {
             error.to_string()
         };
@@ -263,6 +303,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/version", get(version))
         .route("/api/v1/capabilities", get(capabilities))
         .route("/api/v1/jobs", post(create_job).get(list_jobs))
+        .route(
+            "/api/v1/inference",
+            post(create_inference)
+                .layer(DefaultBodyLimit::max(crate::inference::MAX_REQUEST_BYTES)),
+        )
+        .route("/api/v1/jobs/{id}/inference", get(get_inference))
         .route("/api/v1/jobs/cleanup", post(cleanup_jobs))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
@@ -312,7 +358,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<CapabilitiesRe
             persistent_jobs: true,
             event_replay: true,
             websocket_events: true,
-            inference_token_streaming: false,
+            inference_token_streaming: true,
             model_management: true,
             hardware_discovery: true,
             durable_model_downloads: true,
@@ -321,7 +367,7 @@ async fn capabilities(State(state): State<Arc<AppState>>) -> Json<CapabilitiesRe
             .into_iter()
             .map(|job_type| JobTypeCapability {
                 job_type,
-                implemented: job_type == JobType::ModelDownload,
+                implemented: matches!(job_type, JobType::ModelDownload | JobType::Inference),
             })
             .collect(),
     })
@@ -332,6 +378,11 @@ async fn create_job(
     payload: Result<Json<CreateJobRequest>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let Json(payload) = payload.map_err(|error| json_rejection(&error))?;
+    if payload.job_type == JobType::Inference {
+        return Err(ApiError::validation(
+            "submit structured inference requests to /api/v1/inference",
+        ));
+    }
     validate_idempotency_key(&payload.idempotency_key)?;
     let (job, created) = state
         .store
@@ -353,6 +404,38 @@ async fn create_job(
             job,
             duplicate: !created,
         }),
+    ))
+}
+
+async fn create_inference(
+    State(state): State<Arc<AppState>>,
+    payload: Result<Json<InferenceRequest>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Json(payload) = payload.map_err(|error| json_rejection(&error))?;
+    let (job, created) = InferenceService::new(state.store.clone(), state.models.clone())
+        .submit(payload)
+        .await?;
+    Ok((
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        Json(CreateJobResponse {
+            job,
+            duplicate: !created,
+        }),
+    ))
+}
+
+async fn get_inference(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(
+        InferenceService::new(state.store.clone(), state.models.clone())
+            .details(&id)
+            .await?,
     ))
 }
 
@@ -517,16 +600,26 @@ async fn retry_job(
             details: json!({ "state": original.state }),
         });
     }
-    let (job, created) = state
-        .store
-        .create_job(CreateJob {
-            idempotency_key: payload.idempotency_key,
-            job_type: original.job_type,
-            input: original.input,
-            parent_job_id: original.parent_job_id,
-            retry_of_job_id: Some(original.id),
-        })
-        .await?;
+    let (job, created) = if original.job_type == JobType::Inference {
+        let mut request: InferenceRequest = serde_json::from_value(original.input)
+            .map_err(|_| ApiError::validation("stored inference request is invalid"))?;
+        request.client_request_id = payload.idempotency_key;
+        request.retry_of_job_id = Some(original.id);
+        InferenceService::new(state.store.clone(), state.models.clone())
+            .submit(request)
+            .await?
+    } else {
+        state
+            .store
+            .create_job(CreateJob {
+                idempotency_key: payload.idempotency_key,
+                job_type: original.job_type,
+                input: original.input,
+                parent_job_id: original.parent_job_id,
+                retry_of_job_id: Some(original.id),
+            })
+            .await?
+    };
     Ok((
         if created {
             StatusCode::CREATED

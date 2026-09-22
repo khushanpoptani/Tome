@@ -1,6 +1,7 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteRow},
@@ -10,7 +11,10 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::model::{EventType, Job, JobEvent, JobState, JobType};
+use crate::{
+    inference::{ContextManifest, GenerationSettings, InferenceDetails, InferenceRequest},
+    model::{EventType, Job, JobEvent, JobState, JobType},
+};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -143,6 +147,103 @@ impl JobStore {
         Ok((job, true))
     }
 
+    pub async fn create_inference_job(
+        &self,
+        request: &InferenceRequest,
+        model_id: &str,
+        artifact_sha256: &str,
+    ) -> Result<(Job, bool), StoreError> {
+        let now = now()?;
+        let id = Uuid::now_v7().to_string();
+        let input = serde_json::to_value(request)
+            .map_err(|error| StoreError::InvalidData(error.to_string()))?;
+        let input_json = serialize(&input)?;
+        let mut transaction = self.pool.begin().await?;
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO jobs
+             (id, idempotency_key, job_type, state, progress, input_json, parent_job_id,
+              retry_of_job_id, created_at, updated_at)
+             VALUES (?, ?, 'inference', 'queued', 0.0, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&request.client_request_id)
+        .bind(&input_json)
+        .bind(&request.parent_job_id)
+        .bind(&request.retry_of_job_id)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected()
+            == 1;
+
+        if !inserted {
+            let row = sqlx::query("SELECT * FROM jobs WHERE idempotency_key = ?")
+                .bind(&request.client_request_id)
+                .fetch_one(&mut *transaction)
+                .await?;
+            let existing = job_from_row(&row)?;
+            if existing.job_type != JobType::Inference
+                || existing.input != input
+                || existing.parent_job_id != request.parent_job_id
+                || existing.retry_of_job_id != request.retry_of_job_id
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            let stored: Option<(String, String)> = sqlx::query_as(
+                "SELECT model_id, model_artifact_sha256 FROM inference_jobs WHERE job_id = ?",
+            )
+            .bind(&existing.id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            if stored
+                .as_ref()
+                .map(|(stored_id, stored_hash)| (stored_id.as_str(), stored_hash.as_str()))
+                != Some((model_id, artifact_sha256))
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            transaction.commit().await?;
+            return Ok((existing, false));
+        }
+
+        sqlx::query(
+            "INSERT INTO inference_jobs
+             (job_id, schema_version, model_id, model_artifact_sha256, request_json,
+              settings_json, created_at, updated_at)
+             VALUES (?, 1, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(model_id)
+        .bind(artifact_sha256)
+        .bind(serialize(request)?)
+        .bind(serialize(&request.settings)?)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await?;
+        let created = insert_event(
+            &mut transaction,
+            Some(&id),
+            EventType::JobCreated,
+            json!({ "job_type": JobType::Inference }),
+            &now,
+        )
+        .await?;
+        let queued = insert_event(
+            &mut transaction,
+            Some(&id),
+            EventType::JobQueued,
+            json!({}),
+            &now,
+        )
+        .await?;
+        let job = fetch_job_in(&mut transaction, &id).await?;
+        transaction.commit().await?;
+        self.publish([created, queued]);
+        Ok((job, true))
+    }
+
     pub async fn get_job(&self, id: &str) -> Result<Job, StoreError> {
         let row = sqlx::query("SELECT * FROM jobs WHERE id = ?")
             .bind(id)
@@ -201,9 +302,36 @@ impl JobStore {
             &now,
         )
         .await?;
+        let inference_event = if job_type_in(&mut transaction, id).await? == JobType::Inference {
+            let recorded = sqlx::query(
+                "UPDATE inference_jobs SET completion_reason = 'stopped', updated_at = ?
+                 WHERE job_id = ?",
+            )
+            .bind(&now)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+            if recorded == 1 {
+                Some(
+                    insert_event(
+                        &mut transaction,
+                        Some(id),
+                        EventType::InferenceStopped,
+                        json!({ "schema_version": 1, "completion_reason": "stopped" }),
+                        &now,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let job = fetch_job_in(&mut transaction, id).await?;
         transaction.commit().await?;
-        self.publish([event]);
+        self.publish(std::iter::once(event).chain(inference_event));
         Ok(job)
     }
 
@@ -440,13 +568,14 @@ impl JobStore {
 
     pub async fn recover_interrupted(&self) -> Result<u64, StoreError> {
         let mut transaction = self.pool.begin().await?;
-        let rows = sqlx::query("SELECT id FROM jobs WHERE state = 'running'")
+        let rows = sqlx::query("SELECT id, job_type FROM jobs WHERE state = 'running'")
             .fetch_all(&mut *transaction)
             .await?;
         let now = now()?;
         let mut events = Vec::with_capacity(rows.len());
         for row in &rows {
             let id: String = row.try_get("id")?;
+            let job_type: JobType = parse(&row.try_get::<String, _>("job_type")?)?;
             sqlx::query(
                 "UPDATE jobs SET state = 'interrupted', updated_at = ?, finished_at = ?,
                  error_json = ? WHERE id = ? AND state = 'running'",
@@ -473,6 +602,29 @@ impl JobStore {
                 )
                 .await?,
             );
+            if job_type == JobType::Inference {
+                let recorded = sqlx::query(
+                    "UPDATE inference_jobs SET completion_reason = 'interrupted', updated_at = ?
+                     WHERE job_id = ?",
+                )
+                .bind(&now)
+                .bind(&id)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                if recorded == 1 {
+                    events.push(
+                        insert_event(
+                            &mut transaction,
+                            Some(&id),
+                            EventType::InferenceInterrupted,
+                            json!({ "schema_version": 1, "completion_reason": "interrupted" }),
+                            &now,
+                        )
+                        .await?,
+                    );
+                }
+            }
         }
         transaction.commit().await?;
         self.publish(events);
@@ -508,6 +660,226 @@ impl JobStore {
         transaction.commit().await?;
         self.publish([event.clone()]);
         Ok(event)
+    }
+
+    pub async fn inference_event(
+        &self,
+        job_id: &str,
+        event_type: EventType,
+        payload: Value,
+    ) -> Result<JobEvent, StoreError> {
+        if payload.to_string().len() > 128 * 1024 {
+            return Err(StoreError::InvalidData(
+                "inference event payload exceeded 128 KiB".to_owned(),
+            ));
+        }
+        let timestamp = now()?;
+        let mut transaction = self.pool.begin().await?;
+        let event = insert_event(
+            &mut transaction,
+            Some(job_id),
+            event_type,
+            payload,
+            &timestamp,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.publish([event.clone()]);
+        Ok(event)
+    }
+
+    pub async fn save_context_manifest(
+        &self,
+        job_id: &str,
+        manifest: &ContextManifest,
+    ) -> Result<(), StoreError> {
+        let changed = sqlx::query(
+            "UPDATE inference_jobs SET context_manifest_json = ?, updated_at = ? WHERE job_id = ?",
+        )
+        .bind(serialize(manifest)?)
+        .bind(now()?)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub async fn save_output_checkpoint(
+        &self,
+        job_id: &str,
+        output: &str,
+        sequence: u64,
+        usage: Option<&Value>,
+    ) -> Result<(), StoreError> {
+        let sequence = i64::try_from(sequence).map_err(|_| {
+            StoreError::InvalidData("output sequence exceeds SQLite range".to_owned())
+        })?;
+        let timestamp = now()?;
+        let mut transaction = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE inference_jobs SET output_text = ?, output_sequence = ?, usage_json = ?,
+             updated_at = ? WHERE job_id = ? AND output_sequence <= ?",
+        )
+        .bind(output)
+        .bind(sequence)
+        .bind(usage.map(serialize).transpose()?)
+        .bind(&timestamp)
+        .bind(job_id)
+        .bind(sequence)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::InvalidState);
+        }
+        let checkpoint_text = (output.len() <= 96 * 1024).then_some(output);
+        let event = insert_event(
+            &mut transaction,
+            Some(job_id),
+            EventType::InferenceOutputCheckpoint,
+            json!({
+                "schema_version": 1,
+                "output_sequence": sequence,
+                "text": checkpoint_text,
+                "output_bytes": output.len(),
+                "output_sha256": format!("{:x}", Sha256::digest(output.as_bytes())),
+                "requires_fetch": checkpoint_text.is_none(),
+                "usage": usage,
+            }),
+            &timestamp,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.publish([event]);
+        Ok(())
+    }
+
+    pub async fn append_inference_delta(
+        &self,
+        job_id: &str,
+        text: &str,
+        sequence: u64,
+    ) -> Result<(), StoreError> {
+        if text.is_empty() || text.len() > 128 * 1024 {
+            return Err(StoreError::InvalidData(
+                "inference delta must contain 1 to 131072 bytes".to_owned(),
+            ));
+        }
+        let sequence = i64::try_from(sequence).map_err(|_| {
+            StoreError::InvalidData("output sequence exceeds SQLite range".to_owned())
+        })?;
+        let timestamp = now()?;
+        let mut transaction = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE inference_jobs SET output_text = output_text || ?, output_sequence = ?,
+             updated_at = ? WHERE job_id = ? AND output_sequence = ?",
+        )
+        .bind(text)
+        .bind(sequence)
+        .bind(&timestamp)
+        .bind(job_id)
+        .bind(sequence - 1)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::InvalidState);
+        }
+        let event = insert_event(
+            &mut transaction,
+            Some(job_id),
+            EventType::InferenceTextDelta,
+            json!({ "schema_version": 1, "output_sequence": sequence, "text": text }),
+            &timestamp,
+        )
+        .await?;
+        transaction.commit().await?;
+        self.publish([event]);
+        Ok(())
+    }
+
+    pub async fn save_inference_terminal(
+        &self,
+        job_id: &str,
+        output: &str,
+        sequence: u64,
+        usage: Option<&Value>,
+        completion_reason: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE inference_jobs SET output_text = ?, output_sequence = ?, usage_json = ?,
+             completion_reason = ?, updated_at = ? WHERE job_id = ?",
+        )
+        .bind(output)
+        .bind(i64::try_from(sequence).map_err(|_| {
+            StoreError::InvalidData("output sequence exceeds SQLite range".to_owned())
+        })?)
+        .bind(usage.map(serialize).transpose()?)
+        .bind(completion_reason)
+        .bind(now()?)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn mark_inference_failed(&self, job_id: &str) -> Result<(), StoreError> {
+        let changed = sqlx::query(
+            "UPDATE inference_jobs SET completion_reason = 'failed', updated_at = ?
+             WHERE job_id = ?",
+        )
+        .bind(now()?)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if changed != 1 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub async fn inference_details(&self, job_id: &str) -> Result<InferenceDetails, StoreError> {
+        let row = sqlx::query("SELECT * FROM inference_jobs WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        let request: InferenceRequest = parse_typed(&row.try_get::<String, _>("request_json")?)?;
+        let settings: GenerationSettings =
+            parse_typed(&row.try_get::<String, _>("settings_json")?)?;
+        let manifest = row
+            .try_get::<Option<String>, _>("context_manifest_json")?
+            .as_deref()
+            .map(parse_typed)
+            .transpose()?;
+        let usage =
+            parse_optional_json(row.try_get::<Option<String>, _>("usage_json")?.as_deref())?;
+        let output_sequence =
+            u64::try_from(row.try_get::<i64, _>("output_sequence")?).map_err(|_| {
+                StoreError::InvalidData("stored output sequence is negative".to_owned())
+            })?;
+        let warnings: Vec<String> = parse_typed(&row.try_get::<String, _>("warnings_json")?)?;
+        Ok(InferenceDetails {
+            schema_version: u32::try_from(row.try_get::<i64, _>("schema_version")?).map_err(
+                |_| StoreError::InvalidData("stored inference schema is invalid".to_owned()),
+            )?,
+            job_id: job_id.to_owned(),
+            model_id: row.try_get("model_id")?,
+            model_artifact_sha256: row.try_get("model_artifact_sha256")?,
+            request,
+            settings,
+            context_manifest: manifest,
+            output_text: row.try_get("output_text")?,
+            output_sequence,
+            usage,
+            completion_reason: row.try_get("completion_reason")?,
+            warnings,
+        })
     }
 
     pub async fn cleanup_terminal_before(&self, before: &str) -> Result<u64, StoreError> {
@@ -583,6 +955,22 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
         .await?;
         transaction.commit().await?;
     }
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tome_migrations WHERE version = 3")
+        .fetch_one(pool)
+        .await?;
+    if applied == 0 {
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(include_str!("../migrations/0003_inference.sql"))
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "INSERT INTO tome_migrations (version, name, applied_at) VALUES (3, 'inference', ?)",
+        )
+        .bind(now()?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+    }
     Ok(())
 }
 
@@ -596,6 +984,18 @@ async fn fetch_job_in(
         .await?
         .ok_or(StoreError::NotFound)?;
     job_from_row(&row)
+}
+
+async fn job_type_in(
+    transaction: &mut Transaction<'_, Sqlite>,
+    id: &str,
+) -> Result<JobType, StoreError> {
+    let value: String = sqlx::query_scalar("SELECT job_type FROM jobs WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+    parse(&value)
 }
 
 async fn insert_event(
@@ -667,6 +1067,14 @@ fn parse_json(value: &str) -> Result<Value, StoreError> {
 
 fn parse_optional_json(value: Option<&str>) -> Result<Option<Value>, StoreError> {
     value.map(parse_json).transpose()
+}
+
+fn serialize<T: serde::Serialize>(value: &T) -> Result<String, StoreError> {
+    serde_json::to_string(value).map_err(|error| StoreError::InvalidData(error.to_string()))
+}
+
+fn parse_typed<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, StoreError> {
+    serde_json::from_str(value).map_err(|error| StoreError::InvalidData(error.to_string()))
 }
 
 fn now() -> Result<String, StoreError> {

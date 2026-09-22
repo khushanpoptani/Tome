@@ -3,6 +3,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ChangeEvent,
   type ErrorInfo,
@@ -44,7 +45,21 @@ import {
   setDefaultModel,
   startDownload,
   type ModelSnapshot,
+  type InstalledModel,
 } from './model-management';
+import {
+  eventSocketUrl,
+  generationFromDetails,
+  interactionMarkdown,
+  loadInferenceDetails,
+  loadInferenceEvents,
+  loadServerJob,
+  reconcileOutput,
+  sanitizedJobExport,
+  submitInference,
+  type InferenceEvent,
+  type InferenceRequest,
+} from './inference';
 
 type Screen = 'chats' | 'connections' | 'models' | 'jobs' | 'settings';
 
@@ -254,6 +269,9 @@ export function App() {
         {screen === 'chats' && (
           <ChatsScreen
             selected={selectedChat}
+            profile={profile}
+            connection={connection}
+            settings={data.settings}
             onRefresh={refresh}
             onOpen={(id) => void openChat(id)}
             onError={setError}
@@ -322,13 +340,39 @@ function PageHeader({
   );
 }
 
+function branchToUser(
+  messages: Chat['messages'],
+  userMessageId: string,
+): Chat['messages'] {
+  const byId = new Map(messages.map((message) => [message.id, message]));
+  const branch: Chat['messages'] = [];
+  const seen = new Set<string>();
+  let current = byId.get(userMessageId);
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    branch.push(current);
+    current = current.parentMessageId
+      ? byId.get(current.parentMessageId)
+      : undefined;
+  }
+  branch.reverse();
+  const system = messages.filter((message) => message.role === 'system');
+  return [...system, ...branch.filter((message) => message.role !== 'system')];
+}
+
 function ChatsScreen({
   selected,
+  profile,
+  connection,
+  settings,
   onRefresh,
   onOpen,
   onError,
 }: {
   selected: Chat | null;
+  profile: ServerProfile | null;
+  connection: ConnectionState;
+  settings: ClientSettings;
   onRefresh: () => Promise<void>;
   onOpen: (id: string) => void;
   onError: (message: string) => void;
@@ -337,6 +381,494 @@ function ChatsScreen({
   const [renameTitle, setRenameTitle] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState('');
+  const [conversation, setConversation] = useState<Chat | null>(selected);
+  const [prompt, setPrompt] = useState('');
+  const [temperature, setTemperature] = useState(settings.defaultTemperature);
+  const [models, setModels] = useState<InstalledModel[]>([]);
+  const [modelId, setModelId] = useState('');
+  const [streamState, setStreamState] = useState('offline');
+  const activeChat = useRef<Chat | null>(selected);
+  const socket = useRef<WebSocket | null>(null);
+  const reconnectTimer = useRef<number | null>(null);
+  const partialTimer = useRef<number | null>(null);
+
+  useEffect(() => {
+    setConversation(selected);
+    activeChat.current = selected;
+    socket.current?.close();
+    if (!selected) return;
+    storage
+      .loadPartialResponses(selected.id)
+      .then(async (partials) => {
+        if (!partials.length) return;
+        let recovered = selected;
+        const terminalMessageIds: string[] = [];
+        const resumableJobs: Array<{
+          messageId: string;
+          jobId: string;
+          retryOfJobId: string | null;
+        }> = [];
+        for (const partial of partials) {
+          const index = recovered.messages.findIndex(
+            (message) => message.id === partial.messageId,
+          );
+          if (index < 0) continue;
+          let content = partial.content;
+          let generation = recovered.messages[index].generation;
+          if (partial.jobId && profile) {
+            try {
+              const details = await loadInferenceDetails(
+                profile,
+                partial.jobId,
+              );
+              if (
+                details.output_sequence >= (generation?.outputSequence ?? 0)
+              ) {
+                content = details.output_text;
+                const job = await loadServerJob(profile, partial.jobId);
+                generation = generationFromDetails(
+                  details,
+                  job.state,
+                  generation?.retryOfJobId ?? null,
+                );
+                if (
+                  ['completed', 'cancelled', 'failed', 'interrupted'].includes(
+                    job.state,
+                  )
+                ) {
+                  terminalMessageIds.push(partial.messageId);
+                } else {
+                  resumableJobs.push({
+                    messageId: partial.messageId,
+                    jobId: partial.jobId,
+                    retryOfJobId: generation?.retryOfJobId ?? null,
+                  });
+                }
+              }
+            } catch {
+              generation = generation
+                ? { ...generation, state: 'offline' }
+                : generation;
+            }
+          }
+          const messages = [...recovered.messages];
+          messages[index] = { ...messages[index], content, generation };
+          recovered = { ...recovered, messages };
+        }
+        activeChat.current = await storage.saveChat(recovered);
+        setConversation(activeChat.current);
+        await Promise.all(
+          terminalMessageIds.map((messageId) =>
+            storage.clearPartialResponse(selected.id, messageId),
+          ),
+        );
+        const resumable = resumableJobs.at(-1);
+        if (resumable) {
+          monitorJob(
+            resumable.messageId,
+            resumable.jobId,
+            resumable.retryOfJobId,
+          );
+        }
+        setNotice('Recovered an interrupted partial response.');
+      })
+      .catch((reason) => onError(String(reason)));
+  }, [selected, profile, onError]);
+
+  useEffect(() => {
+    const perServer = settings.serverTemperatures as
+      Record<string, number> | undefined;
+    const saved = profile ? perServer?.[profile.id] : undefined;
+    setTemperature(
+      typeof saved === 'number' && Number.isFinite(saved)
+        ? Math.min(2, Math.max(0, saved))
+        : settings.defaultTemperature,
+    );
+  }, [settings, profile]);
+
+  useEffect(() => {
+    if (!profile || connection.status !== 'connected') {
+      setModels([]);
+      setStreamState('offline');
+      return;
+    }
+    setStreamState('connected');
+    loadModelSnapshot(profile)
+      .then((snapshot) => {
+        const compatible = snapshot.inventory.models.filter(
+          (model) =>
+            model.verification_state === 'verified' &&
+            model.compatibility_state === 'compatible' &&
+            model.capabilities.includes('text_output'),
+        );
+        setModels(compatible);
+        setModelId((current) =>
+          compatible.some((model) => model.id === current)
+            ? current
+            : (settings.defaultModels[profile.id] ??
+              snapshot.inventory.default_model_id ??
+              compatible[0]?.id ??
+              ''),
+        );
+      })
+      .catch((reason) => onError(String(reason)));
+  }, [profile, connection.status, settings.defaultModels, onError]);
+
+  useEffect(
+    () => () => {
+      socket.current?.close();
+      if (reconnectTimer.current) window.clearTimeout(reconnectTimer.current);
+      if (partialTimer.current) window.clearTimeout(partialTimer.current);
+    },
+    [],
+  );
+
+  async function persist(chat: Chat) {
+    const saved = await storage.saveChat(chat);
+    activeChat.current = saved;
+    setConversation(saved);
+    return saved;
+  }
+
+  function renderAssistant(
+    messageId: string,
+    transform: (message: Chat['messages'][number]) => Chat['messages'][number],
+  ) {
+    const chat = activeChat.current;
+    if (!chat) return;
+    const messages = chat.messages.map((message) =>
+      message.id === messageId ? transform(message) : message,
+    );
+    const next = { ...chat, messages };
+    activeChat.current = next;
+    setConversation(next);
+  }
+
+  function checkpointPartial(messageId: string, jobId: string) {
+    if (partialTimer.current) window.clearTimeout(partialTimer.current);
+    partialTimer.current = window.setTimeout(() => {
+      const chat = activeChat.current;
+      const message = chat?.messages.find((item) => item.id === messageId);
+      if (chat && message) {
+        void storage.savePartialResponse(
+          chat.id,
+          messageId,
+          jobId,
+          message.content,
+        );
+      }
+    }, 350);
+  }
+
+  async function finalizeJob(
+    assistantId: string,
+    jobId: string,
+    retryOfJobId: string | null,
+  ) {
+    if (!profile) return;
+    let [details, job] = await Promise.all([
+      loadInferenceDetails(profile, jobId),
+      loadServerJob(profile, jobId),
+    ]);
+    if (job.state === 'cancelled') {
+      // The cancellation event is committed before the inference worker observes it.
+      // Wait for the worker's final durable checkpoint, then require a stable sequence.
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 150));
+        const reconciled = await loadInferenceDetails(profile, jobId);
+        const stable = reconciled.output_sequence === details.output_sequence;
+        details = reconciled;
+        if (stable) break;
+      }
+      job = await loadServerJob(profile, jobId);
+    }
+    renderAssistant(assistantId, (message) => ({
+      ...message,
+      content: details.output_text,
+      generation: generationFromDetails(details, job.state, retryOfJobId),
+    }));
+    if (activeChat.current) await persist(activeChat.current);
+    if (
+      activeChat.current &&
+      ['completed', 'cancelled', 'failed', 'interrupted'].includes(job.state)
+    ) {
+      await storage.clearPartialResponse(activeChat.current.id, assistantId);
+    }
+    setStreamState(job.state === 'cancelled' ? 'stopped' : job.state);
+    socket.current?.close();
+    await onRefresh();
+  }
+
+  function monitorJob(
+    assistantId: string,
+    jobId: string,
+    retryOfJobId: string | null,
+  ) {
+    if (!profile) return;
+    let stopped = false;
+    let cursor = profile.lastEventId;
+    const connect = () => {
+      if (stopped || !profile) return;
+      setStreamState('reconnecting');
+      const current = new WebSocket(eventSocketUrl(profile, cursor));
+      socket.current = current;
+      current.onopen = () => setStreamState('queued');
+      current.onmessage = (message) => {
+        const event = JSON.parse(String(message.data)) as InferenceEvent;
+        if (event.event_id > cursor) {
+          cursor = event.event_id;
+          void storage.setEventCursor(profile.id, event.event_id);
+        }
+        if (event.job_id !== jobId) return;
+        const stateByEvent: Record<string, string> = {
+          'job.started': 'loading_model',
+          'inference.context_prepared': 'preparing_context',
+          'inference.generation_started': 'generating',
+          'inference.text_delta': 'generating',
+          'inference.output_checkpoint': 'generating',
+        };
+        const nextState = stateByEvent[event.event_type];
+        if (nextState) {
+          setStreamState(nextState);
+          renderAssistant(assistantId, (assistant) => {
+            const reconciled = reconcileOutput(
+              assistant.content,
+              assistant.generation?.outputSequence ?? 0,
+              event,
+            );
+            return {
+              ...assistant,
+              content: reconciled.text,
+              generation: assistant.generation
+                ? {
+                    ...assistant.generation,
+                    state: nextState,
+                    outputSequence: reconciled.sequence,
+                  }
+                : assistant.generation,
+            };
+          });
+          if (event.payload.requires_fetch === true) {
+            void loadInferenceDetails(profile, jobId)
+              .then((details) =>
+                renderAssistant(assistantId, (assistant) => ({
+                  ...assistant,
+                  content: details.output_text,
+                  generation: assistant.generation
+                    ? {
+                        ...assistant.generation,
+                        outputSequence: details.output_sequence,
+                      }
+                    : assistant.generation,
+                })),
+              )
+              .catch((reason) => onError(String(reason)));
+          }
+          checkpointPartial(assistantId, jobId);
+        }
+        if (
+          [
+            'job.completed',
+            'job.cancelled',
+            'job.failed',
+            'job.interrupted',
+          ].includes(event.event_type)
+        ) {
+          stopped = true;
+          void finalizeJob(assistantId, jobId, retryOfJobId).catch((reason) =>
+            onError(String(reason)),
+          );
+        }
+      };
+      current.onclose = () => {
+        if (!stopped) {
+          setStreamState('reconnecting');
+          reconnectTimer.current = window.setTimeout(
+            connect,
+            settings.connection.retryDelayMs,
+          );
+        }
+      };
+      current.onerror = () => setStreamState('reconnecting');
+    };
+    connect();
+  }
+
+  async function beginInference(
+    text: string,
+    editedFrom: string | null = null,
+    retryOfJobId: string | null = null,
+    reuseUser?: Chat['messages'][number],
+  ) {
+    const chat = activeChat.current;
+    if (!chat || !profile || connection.status !== 'connected' || !modelId)
+      return;
+    const now = new Date().toISOString();
+    const editedOriginal = editedFrom
+      ? chat.messages.find((message) => message.id === editedFrom)
+      : null;
+    const latestAssistant = [...chat.messages]
+      .reverse()
+      .find((message) => message.role === 'assistant');
+    const user =
+      reuseUser ??
+      ({
+        id: crypto.randomUUID(),
+        role: 'user' as const,
+        content: text.trim(),
+        createdAt: now,
+        parentMessageId: editedFrom
+          ? (editedOriginal?.parentMessageId ?? null)
+          : (latestAssistant?.id ?? null),
+        attachmentIds: [],
+      } satisfies Chat['messages'][number]);
+    const assistantId = crypto.randomUUID();
+    const assistant = {
+      id: assistantId,
+      role: 'assistant' as const,
+      content: '',
+      createdAt: now,
+      parentMessageId: user.id,
+      attachmentIds: [],
+      generation: {
+        modelId,
+        modelArtifactSha256: null,
+        temperature,
+        maxOutputTokens: 512,
+        jobId: null,
+        state: 'queued',
+        outputSequence: 0,
+        usage: null,
+        completionReason: null,
+        contextWarnings: [],
+        retryOfJobId,
+      },
+    } satisfies Chat['messages'][number];
+    const staged = await persist({
+      ...chat,
+      serverProfileId: profile.id,
+      modelId,
+      messages: reuseUser
+        ? [...chat.messages, assistant]
+        : [...chat.messages, user, assistant],
+    });
+    setPrompt('');
+    setStreamState('queued');
+    const branchMessages = branchToUser(staged.messages, user.id);
+    const branchParentJobId = editedFrom
+      ? (chat.messages.find(
+          (message) =>
+            message.role === 'assistant' &&
+            message.parentMessageId === editedFrom,
+        )?.generation?.jobId ?? null)
+      : null;
+    const request: InferenceRequest = {
+      schema_version: 1,
+      client_request_id: assistantId,
+      model_id: modelId,
+      messages: branchMessages
+        .filter((message) => message.role !== 'system')
+        .map(({ id, role, content }) => ({ id, role, content })),
+      system_instructions: branchMessages
+        .filter((message) => message.role === 'system')
+        .map(({ id, content }) => ({ id, content, pinned: true })),
+      settings: {
+        temperature,
+        max_output_tokens: 512,
+        agent_tool_reserve: 256,
+      },
+      correlation: {
+        chat_id: staged.id,
+        user_message_id: user.id,
+        assistant_message_id: assistantId,
+        client_revision_id: editedFrom,
+      },
+      parent_job_id: branchParentJobId,
+      retry_of_job_id: retryOfJobId,
+    };
+    try {
+      const { job } = await submitInference(profile, request);
+      renderAssistant(assistantId, (message) => ({
+        ...message,
+        generation: message.generation
+          ? { ...message.generation, jobId: job.id, state: job.state }
+          : message.generation,
+      }));
+      if (activeChat.current) {
+        activeChat.current = await persist({
+          ...activeChat.current,
+          jobReferences: [
+            ...activeChat.current.jobReferences,
+            {
+              jobId: job.id,
+              serverProfileId: profile.id,
+              messageId: assistantId,
+              parentJobId: job.parent_job_id ?? null,
+              retryOfJobId: job.retry_of_job_id ?? null,
+              lastKnownState: job.state,
+              updatedAt: new Date().toISOString(),
+            },
+          ],
+        });
+      }
+      await storage.savePartialResponse(staged.id, assistantId, job.id, '');
+      monitorJob(assistantId, job.id, retryOfJobId);
+    } catch (reason) {
+      renderAssistant(assistantId, (message) => ({
+        ...message,
+        generation: message.generation
+          ? { ...message.generation, state: 'failed' }
+          : message.generation,
+      }));
+      if (activeChat.current) await persist(activeChat.current);
+      onError(String(reason));
+    }
+  }
+
+  async function exportInteraction(
+    user: Chat['messages'][number],
+    assistant: Chat['messages'][number],
+    format: 'markdown' | 'json',
+  ) {
+    let server: unknown = null;
+    let localOnly = true;
+    if (profile && assistant.generation?.jobId) {
+      try {
+        const [job, details, events] = await Promise.all([
+          loadServerJob(profile, assistant.generation.jobId),
+          loadInferenceDetails(profile, assistant.generation.jobId),
+          loadInferenceEvents(profile, assistant.generation.jobId),
+        ]);
+        server = { job, details, events };
+        localOnly = false;
+      } catch {
+        localOnly = true;
+      }
+    }
+    const extension = format === 'markdown' ? 'md' : 'json';
+    const destination = await saveDialog({
+      title: 'Export Tome interaction',
+      defaultPath: `tome-interaction-${user.id.slice(0, 8)}.${extension}`,
+      filters: [
+        {
+          name: format === 'markdown' ? 'Markdown' : 'JSON',
+          extensions: [extension],
+        },
+      ],
+    });
+    if (!destination) return;
+    const content =
+      format === 'markdown'
+        ? interactionMarkdown(user, assistant, localOnly)
+        : sanitizedJobExport({
+            schema_version: 1,
+            local_only: localOnly,
+            client: { user, assistant },
+            server,
+          });
+    await storage.writeInteractionExport(destination, content);
+    setNotice(`Interaction exported as ${extension.toUpperCase()}.`);
+  }
 
   function beginRename(chat: Chat) {
     setRenameTitle(chat.title);
@@ -390,22 +922,34 @@ function ChatsScreen({
     }
   }
 
+  const chat = conversation;
+  const activeAssistant = [...(chat?.messages ?? [])]
+    .reverse()
+    .find(
+      (message) =>
+        message.role === 'assistant' &&
+        [
+          'queued',
+          'loading_model',
+          'preparing_context',
+          'generating',
+          'reconnecting',
+        ].includes(message.generation?.state ?? ''),
+    );
+
   return (
     <section className="conversation-workspace">
-      {selected ? (
+      {chat ? (
         <>
-          <PageHeader eyebrow="Stored on this Mac" title={selected.title}>
+          <PageHeader eyebrow="Stored on this Mac" title={chat.title}>
             <div className="row-actions chat-actions">
               <button
                 className="secondary"
-                onClick={() => void exportOne(selected)}
+                onClick={() => void exportOne(chat)}
               >
                 Export
               </button>
-              <button
-                className="secondary"
-                onClick={() => beginRename(selected)}
-              >
+              <button className="secondary" onClick={() => beginRename(chat)}>
                 Rename
               </button>
               <button
@@ -421,13 +965,232 @@ function ChatsScreen({
               {notice}
             </p>
           )}
-          <div className="phase-placeholder">
-            <span>Phase 4</span>
-            <h2>Ready for conversation in the next phase</h2>
-            <p>
-              This chat is stored safely on this Mac. Prompting and inference
-              are intentionally unavailable until Phase 4.
-            </p>
+          <div className="conversation-thread" aria-live="polite">
+            {chat.messages.map((message) => {
+              const parent = message.parentMessageId
+                ? chat.messages.find(
+                    (item) => item.id === message.parentMessageId,
+                  )
+                : null;
+              return (
+                <article
+                  className={`chat-message ${message.role}`}
+                  key={message.id}
+                >
+                  <div className="message-heading">
+                    <strong>
+                      {message.role === 'assistant' ? 'Tome' : message.role}
+                    </strong>
+                    {message.generation && (
+                      <span className={`job-state ${message.generation.state}`}>
+                        {message.generation.state.replaceAll('_', ' ')}
+                      </span>
+                    )}
+                  </div>
+                  <p>
+                    {message.content ||
+                      (message.role === 'assistant' ? '…' : '')}
+                  </p>
+                  {message.generation && (
+                    <details className="message-metadata">
+                      <summary>Generation details</summary>
+                      <small>
+                        Model {message.generation.modelId} · temperature{' '}
+                        {message.generation.temperature} · max{' '}
+                        {message.generation.maxOutputTokens} tokens
+                      </small>
+                      {message.generation.jobId && (
+                        <small>Job {message.generation.jobId}</small>
+                      )}
+                      {message.generation.completionReason && (
+                        <small>
+                          Completion: {message.generation.completionReason}
+                        </small>
+                      )}
+                      {message.generation.contextWarnings.map((warning) => (
+                        <small className="warning" key={warning}>
+                          {warning}
+                        </small>
+                      ))}
+                    </details>
+                  )}
+                  <div className="row-actions message-actions">
+                    {message.role === 'user' && (
+                      <button
+                        className="secondary"
+                        disabled={Boolean(activeAssistant)}
+                        onClick={() => {
+                          const edited = window.prompt(
+                            'Edit and resend',
+                            message.content,
+                          );
+                          if (edited?.trim())
+                            void beginInference(edited, message.id);
+                        }}
+                      >
+                        Edit & resend
+                      </button>
+                    )}
+                    {message.role === 'assistant' && parent && (
+                      <>
+                        <button
+                          className="secondary"
+                          disabled={Boolean(activeAssistant)}
+                          onClick={() =>
+                            void beginInference(
+                              parent.content,
+                              null,
+                              message.generation?.jobId ?? null,
+                              parent,
+                            )
+                          }
+                        >
+                          Regenerate
+                        </button>
+                        <button
+                          className="secondary"
+                          onClick={() =>
+                            void exportInteraction(parent, message, 'markdown')
+                          }
+                        >
+                          Export MD
+                        </button>
+                        <button
+                          className="secondary"
+                          onClick={() =>
+                            void exportInteraction(parent, message, 'json')
+                          }
+                        >
+                          Export JSON
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </article>
+              );
+            })}
+            {chat.messages.length === 0 && (
+              <div className="empty-conversation">
+                <h2>Start a private conversation</h2>
+                <p>
+                  Messages are stored on this Mac. The server retains job
+                  records, not your chat library.
+                </p>
+              </div>
+            )}
+          </div>
+          <div className="prompt-dock">
+            <div className="prompt-controls">
+              <label>
+                Model
+                <select
+                  value={modelId}
+                  disabled={Boolean(activeAssistant) || models.length === 0}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setModelId(next);
+                    if (profile && next) {
+                      void storage.saveSettings({
+                        ...settings,
+                        defaultModels: {
+                          ...settings.defaultModels,
+                          [profile.id]: next,
+                        },
+                      });
+                    }
+                  }}
+                >
+                  <option value="">
+                    {models.length ? 'Select a model' : 'No compatible model'}
+                  </option>
+                  {models.map((model) => (
+                    <option value={model.id} key={model.id}>
+                      {model.display_name} · {model.quantization}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Temperature {temperature.toFixed(1)}
+                <input
+                  type="range"
+                  min="0"
+                  max="2"
+                  step="0.1"
+                  value={temperature}
+                  disabled={Boolean(activeAssistant)}
+                  onChange={(event) => {
+                    const next = Number(event.target.value);
+                    setTemperature(next);
+                    if (profile) {
+                      const current =
+                        (settings.serverTemperatures as
+                          Record<string, number> | undefined) ?? {};
+                      void storage.saveSettings({
+                        ...settings,
+                        serverTemperatures: { ...current, [profile.id]: next },
+                      });
+                    }
+                  }}
+                />
+              </label>
+              <span className={`live-state ${streamState}`}>
+                {streamState.replaceAll('_', ' ')}
+              </span>
+            </div>
+            <textarea
+              rows={3}
+              maxLength={262144}
+              value={prompt}
+              placeholder={
+                connection.status === 'connected'
+                  ? 'Message Tome…'
+                  : 'Connect to a private server to send. Local chats remain available.'
+              }
+              disabled={Boolean(activeAssistant)}
+              onChange={(event) => setPrompt(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' && !event.shiftKey) {
+                  event.preventDefault();
+                  if (prompt.trim()) void beginInference(prompt);
+                }
+              }}
+            />
+            <div className="prompt-actions">
+              <button
+                className="secondary"
+                disabled
+                title="Attachments arrive in Phase 6"
+              >
+                Attach
+              </button>
+              {activeAssistant?.generation?.jobId ? (
+                <button
+                  className="danger"
+                  onClick={() =>
+                    profile &&
+                    void cancelServerJob(
+                      profile,
+                      activeAssistant.generation!.jobId!,
+                    )
+                  }
+                >
+                  Stop
+                </button>
+              ) : (
+                <button
+                  disabled={
+                    !prompt.trim() ||
+                    !modelId ||
+                    !profile ||
+                    connection.status !== 'connected'
+                  }
+                  onClick={() => void beginInference(prompt)}
+                >
+                  Send
+                </button>
+              )}
+            </div>
           </div>
           {dialog && (
             <div className="modal-backdrop" role="presentation">
@@ -444,7 +1207,7 @@ function ChatsScreen({
                   <form
                     onSubmit={(event) => {
                       event.preventDefault();
-                      void rename(selected);
+                      void rename(chat);
                     }}
                   >
                     <div>
@@ -481,7 +1244,7 @@ function ChatsScreen({
                 ) : (
                   <div>
                     <p className="eyebrow">Permanent action</p>
-                    <h2 id="chat-dialog-title">Delete “{selected.title}”?</h2>
+                    <h2 id="chat-dialog-title">Delete “{chat.title}”?</h2>
                     <p>
                       This removes the local chat and its client-managed
                       attachment references. Exported files are not affected.
@@ -497,7 +1260,7 @@ function ChatsScreen({
                       <button
                         className="danger"
                         disabled={busy}
-                        onClick={() => void remove(selected)}
+                        onClick={() => void remove(chat)}
                       >
                         {busy ? 'Deleting…' : 'Delete chat'}
                       </button>

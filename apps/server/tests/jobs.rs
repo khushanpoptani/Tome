@@ -11,6 +11,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tome_server::{
     api::{AppState, router},
     config::NetworkMode,
+    inference::{
+        CorrelationMetadata, GenerationSettings, InferenceMessage, InferenceRequest, MessageRole,
+    },
     model::{EventType, JobEvent, JobState, JobType},
     models::ModelManager,
     store::{CreateJob, JobStore, StoreError},
@@ -66,6 +69,71 @@ async fn duplicate_idempotent_submission_returns_original_job() {
         store.create_job(changed).await,
         Err(StoreError::IdempotencyConflict)
     ));
+}
+
+#[tokio::test]
+async fn inference_deltas_are_ordered_durable_and_preserved_on_stop() {
+    let directory = TempDir::new().unwrap();
+    let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let inference = InferenceRequest {
+        schema_version: 1,
+        client_request_id: "inference-checkpoint".to_owned(),
+        model_id: "catalog:fixture".to_owned(),
+        messages: vec![InferenceMessage {
+            id: "message-1".to_owned(),
+            role: MessageRole::User,
+            content: "hello".to_owned(),
+        }],
+        system_instructions: Vec::new(),
+        settings: GenerationSettings::default(),
+        correlation: CorrelationMetadata::default(),
+        parent_job_id: None,
+        retry_of_job_id: None,
+    };
+    let (job, _) = store
+        .create_inference_job(&inference, "catalog:fixture", "abc123")
+        .await
+        .unwrap();
+    let (duplicate, created) = store
+        .create_inference_job(&inference, "catalog:fixture", "abc123")
+        .await
+        .unwrap();
+    assert!(!created);
+    assert_eq!(duplicate.id, job.id);
+    assert!(matches!(
+        store
+            .create_inference_job(&inference, "catalog:fixture", "different")
+            .await,
+        Err(StoreError::IdempotencyConflict)
+    ));
+    store.claim_next_queued().await.unwrap().unwrap();
+    store
+        .append_inference_delta(&job.id, "Hello", 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.append_inference_delta(&job.id, " duplicate", 1).await,
+        Err(StoreError::InvalidState)
+    ));
+    store
+        .append_inference_delta(&job.id, " world", 2)
+        .await
+        .unwrap();
+    store.cancel_job(&job.id).await.unwrap();
+    let details = store.inference_details(&job.id).await.unwrap();
+    assert_eq!(details.output_text, "Hello world");
+    assert_eq!(details.output_sequence, 2);
+    assert_eq!(details.completion_reason.as_deref(), Some("stopped"));
+    let inference_events = store
+        .events_after(0, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|event| event.event_type == EventType::InferenceTextDelta)
+        .collect::<Vec<_>>();
+    assert_eq!(inference_events.len(), 2);
+    assert_eq!(inference_events[0].payload["output_sequence"], 1);
+    assert_eq!(inference_events[1].payload["output_sequence"], 2);
 }
 
 #[tokio::test]
@@ -202,14 +270,43 @@ async fn api_uses_structured_errors_and_reports_capabilities() {
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["protocol"]["current"], 1);
     assert_eq!(body["network_mode"], "lan");
-    assert_eq!(body["features"]["inference_token_streaming"], false);
+    assert_eq!(body["features"]["inference_token_streaming"], true);
     let job_types = body["job_types"].as_array().unwrap();
     assert!(job_types.iter().any(|capability| {
         capability["job_type"] == "model_download" && capability["implemented"] == true
     }));
     assert!(job_types.iter().any(|capability| {
-        capability["job_type"] == "inference" && capability["implemented"] == false
+        capability["job_type"] == "inference" && capability["implemented"] == true
     }));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/inference")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "schema_version": 1,
+                        "client_request_id": "invalid-inference",
+                        "model_id": "catalog:missing",
+                        "messages": [{ "id": "message", "role": "assistant", "content": "wrong order" }],
+                        "settings": { "temperature": 0.7, "max_output_tokens": 512, "agent_tool_reserve": 256 },
+                        "correlation": {},
+                        "parent_job_id": null,
+                        "retry_of_job_id": null
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_inference_request");
 
     let response = app
         .clone()

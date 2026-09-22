@@ -29,6 +29,9 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.ico", "icons/icon.png"],
+    "resources": {
+      "runtime/*": "runtime/"
+    },
     "windows": {
       "nsis": {
         "installMode": "perMachine",

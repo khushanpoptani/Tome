@@ -6,7 +6,7 @@
 2. Approve the Windows administrator prompt. The installer is per-machine and adds Tome Server to the Start menu.
 3. The installer adds two inbound rules for TCP port 7331, scoped to the Tome Server executable. The LAN rule permits only `LocalSubnet` on Private networks; the Tailscale rule permits only `100.64.0.0/10`.
 4. Launch **Tome Server**. On first run, review the port, LAN access, Tailscale access, firewall permission, data directory, and launch-at-login choice, then select **Save and start Tome Server**.
-5. In **Model setup**, review detected hardware/runtime and install a compatible profile or manually choose an approved catalog model. A download remains resumable if the app or PC restarts.
+5. In **Model setup**, confirm the bundled, verified llama.cpp `b10964` CPU runtime is available, then install a compatible profile or manually choose an approved catalog model. A download remains resumable if the app or PC restarts.
 
 The development installer is unsigned, so Windows may show a publisher warning. Release signing is intentionally deferred.
 
@@ -30,7 +30,9 @@ If Tailscale is unavailable, the dashboard distinguishes not installed, not sign
 
 Changing the port or firewall option may trigger an administrator prompt so Tome can replace the restricted inbound rules.
 
-The model panel shows system memory, GPU data when Windows reports it, filesystem free space, llama.cpp availability, installed/default/loaded models, and durable download progress. GPU memory is shown as unknown when the Windows probe does not provide a reliable value. Install a reviewed `llama-server.exe` on `PATH` or configure `TOME_LLAMA_SERVER_PATH`; without it, downloads may be verified and registered but load/readiness remains explicitly unavailable.
+The model panel shows system memory, GPU data when Windows reports it, filesystem free space, the exact llama.cpp build, installed/default/loaded models, and durable download progress. GPU memory is shown as unknown when the Windows probe does not provide a reliable value. The installer includes the reviewed CPU runtime and verifies every runtime file before use. `TOME_LLAMA_SERVER_PATH` is only an advanced explicit override; an unavailable or altered runtime fails visibly.
+
+The internal runtime is launched without a console on a dynamic `127.0.0.1` port and is never covered by Tome's LAN/Tailscale firewall rules. The dashboard API remains the only private-network entry point.
 
 ## Uninstall or upgrade
 
