@@ -456,8 +456,7 @@ fn hidden_command(program: &str, arguments: &[&str]) -> Command {
 #[cfg(windows)]
 fn firewall_status() -> String {
     let script = format!(
-        "if ((Get-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue) -and (Get-NetFirewallRule -DisplayName '{}' -ErrorAction SilentlyContinue)) {{ exit 0 }} else {{ exit 1 }}",
-        LAN_RULE, TAILSCALE_RULE
+        "if ((Get-NetFirewallRule -DisplayName '{LAN_RULE}' -ErrorAction SilentlyContinue) -and (Get-NetFirewallRule -DisplayName '{TAILSCALE_RULE}' -ErrorAction SilentlyContinue)) {{ exit 0 }} else {{ exit 1 }}"
     );
     hidden_command("powershell.exe", &["-NoProfile", "-Command", &script])
         .status()
