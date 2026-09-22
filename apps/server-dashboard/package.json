@@ -1,12 +1,12 @@
 {
-  "name": "@tome/client",
+  "name": "@tome/server-dashboard",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "build:dmg": "tauri build --target aarch64-apple-darwin --bundles dmg",
+    "build:nsis": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
     "build:web": "vite build",
-    "dev:web": "vite --host 127.0.0.1 --port 1420",
+    "dev:web": "vite --host 127.0.0.1 --port 1430",
     "lint": "eslint . --max-warnings 0",
     "tauri": "tauri",
     "test": "vitest run",
@@ -14,7 +14,6 @@
   },
   "dependencies": {
     "@tauri-apps/api": "2.11.1",
-    "@tauri-apps/plugin-http": "2.6.1",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },

@@ -10,6 +10,7 @@ tauri-build = { version = "=2.6.3", features = [] }
 
 [dependencies]
 tauri = { version = "=2.11.6", features = [] }
+tauri-plugin-http = { version = "=2.7.0", default-features = false }
 
 [lints]
 workspace = true

@@ -10,7 +10,8 @@
   "scripts": {
     "build:client": "pnpm --filter @tome/client build:dmg",
     "build:server": "cargo build --locked --release -p tome-server",
-    "build:server:windows": "cargo build --locked --release -p tome-server --target x86_64-pc-windows-msvc",
+    "build:server:windows": "pnpm --filter @tome/server-dashboard build:nsis",
+    "build:server-dashboard:web": "pnpm --filter @tome/server-dashboard build:web",
     "build:web": "pnpm --filter @tome/client build:web",
     "check": "pnpm format:check && pnpm lint && pnpm test && pnpm typecheck:web",
     "dev:client": "pnpm --filter @tome/client tauri dev",
@@ -19,10 +20,10 @@
     "format:check:web": "prettier --check .",
     "format:web": "prettier --write .",
     "lint": "pnpm lint:web && cargo clippy --workspace --all-targets --locked -- -D warnings",
-    "lint:web": "pnpm --filter @tome/client lint",
+    "lint:web": "pnpm --recursive --if-present lint",
     "test": "pnpm test:web && cargo test --workspace --locked",
-    "test:web": "pnpm --filter @tome/client test",
-    "typecheck:web": "pnpm --filter @tome/client typecheck"
+    "test:web": "pnpm --recursive --if-present test",
+    "typecheck:web": "pnpm --recursive --if-present typecheck"
   },
   "devDependencies": {
     "prettier": "3.9.8"

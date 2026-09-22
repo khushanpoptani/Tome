@@ -38,9 +38,26 @@ pnpm dev:client        # run the macOS client in development mode
 pnpm check             # formatting, linting, tests, and type checking
 pnpm build:web         # build only the web frontend
 pnpm build:server      # build the server for the current host
+pnpm build:server-dashboard:web # build the Windows dashboard frontend
 ```
 
 Run `pnpm format` to apply repository formatting.
+
+## Running the Phase 1 server
+
+The default configuration is intentionally loopback-only:
+
+```sh
+cargo run -p tome-server
+```
+
+To listen on a private LAN interface, choose the interface address explicitly rather than using a wildcard:
+
+```sh
+TOME_NETWORK_MODE=lan TOME_BIND_ADDRESS=192.168.1.20 cargo run -p tome-server
+```
+
+For Tailscale, use the machine's `100.64.0.0/10` address (or Tailscale IPv6 address) and set `TOME_NETWORK_MODE=tailscale`. See [Phase 1 server and jobs](phase-1-server.md) for all configuration, safety constraints, and API details.
 
 ## Distribution builds
 
@@ -52,12 +69,12 @@ pnpm build:client
 
 The artifact is written below `target/aarch64-apple-darwin/release/bundle/dmg/`.
 
-Build the Windows server executable on 64-bit Windows:
+Build the Windows server NSIS installer on 64-bit Windows:
 
 ```powershell
 pnpm build:server:windows
 ```
 
-The artifact is written to `target\x86_64-pc-windows-msvc\release\tome-server.exe`.
+The primary artifact is written below `target\x86_64-pc-windows-msvc\release\bundle\nsis\` as `*-setup.exe`. The raw `tome-server.exe` console binary is an internal developer artifact, not the Windows product.
 
-CI runs both native distribution builds and uploads the unsigned artifacts for inspection. Release signing and publication are intentionally deferred.
+CI runs both native distribution builds, validates the NSIS package and Windows GUI subsystem, and uploads the unsigned installer for inspection. Release signing and publication are intentionally deferred. Installation, firewall, first-run, and uninstall behavior are documented in [Windows server installation](windows-server.md).

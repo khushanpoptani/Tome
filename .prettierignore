@@ -3,3 +3,4 @@ node_modules/
 dist/
 Cargo.lock
 pnpm-lock.yaml
+*.ps1
