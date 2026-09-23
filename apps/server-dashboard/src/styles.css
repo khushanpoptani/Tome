@@ -211,6 +211,88 @@ p {
   font-size: 17px;
   letter-spacing: -0.02em;
 }
+.ollama-card {
+  background: white;
+  border: 1px solid #dfe5ed;
+  border-radius: 16px;
+  padding: 23px;
+  box-shadow: 0 4px 18px rgba(24, 25, 28, 0.035);
+}
+.ollama-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+.ollama-card h2 {
+  font-size: 17px;
+  letter-spacing: -0.02em;
+}
+.ollama-card > p {
+  color: #6f727a;
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 8px;
+}
+.runtime-state {
+  flex: none;
+  padding: 7px 10px;
+  border-radius: 999px;
+  color: #8b5929;
+  background: #fff0dc;
+  font-size: 10px;
+  font-weight: 750;
+  text-transform: uppercase;
+}
+.runtime-state.ready {
+  color: #14633b;
+  background: #e6f7ee;
+}
+.runtime-state.error {
+  color: #9a2b22;
+  background: #fbeae8;
+}
+.loopback-note {
+  display: grid;
+  gap: 4px;
+  margin: 15px 0;
+  padding: 12px 13px;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  background: #f7f8fa;
+}
+.loopback-note strong {
+  font-size: 11px;
+}
+.loopback-note span {
+  color: #6e7178;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.loopback-note code {
+  color: #30333a;
+  font-family: 'Cascadia Mono', Consolas, monospace;
+}
+.consent-note {
+  display: block;
+  max-width: 680px;
+  color: #85878e;
+  font-size: 9px;
+  line-height: 1.45;
+  margin-top: 9px;
+}
+.ollama-card.compact {
+  padding: 16px;
+  margin-bottom: 17px;
+  border-radius: 12px;
+  box-shadow: none;
+}
+.ollama-card.compact h2 {
+  font-size: 15px;
+}
+.ollama-card.compact .loopback-note {
+  margin: 11px 0;
+}
 .panel-heading {
   display: flex;
   align-items: center;
@@ -423,6 +505,8 @@ p {
   border-radius: 22px;
   padding: 32px;
   box-shadow: 0 25px 80px rgba(0, 0, 0, 0.25);
+  max-height: calc(100vh - 60px);
+  overflow: auto;
 }
 .setup-card h2 {
   font-size: 25px;

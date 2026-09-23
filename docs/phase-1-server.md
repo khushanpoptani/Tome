@@ -4,7 +4,9 @@ Phase 1 provides a single-user server foundation for simultaneous private LAN an
 
 ## Installed Windows host
 
-Install the NSIS package and launch **Tome Server** from the Start menu. First-run setup selects the port, private LAN and Tailscale access, Windows Firewall rules, the data directory, and optional launch at login. Administrator approval is required for the per-machine install and whenever firewall rules change.
+Install the NSIS package and launch **Tome Server** from the Start menu. First-run setup reports the required Ollama runtime state and selects the port, private LAN and Tailscale access, Windows Firewall rules, the data directory, and optional launch at login. Administrator approval is required for the per-machine install and whenever firewall rules change.
+
+The dashboard detects the local Ollama executable and checks only `GET http://127.0.0.1:11434/api/version`. It can open Ollama's official Windows download page with explicit user action and can start an installed service with `OLLAMA_HOST=127.0.0.1:11434`. It never runs a remote install script, silently installs Ollama, changes Ollama to a wildcard/LAN/Tailscale bind, creates an Ollama firewall rule, or calls Ollama model inventory, pull, or inference APIs during setup. See [Windows server installation](windows-server.md#ollama-runtime-boundary) for states and troubleshooting.
 
 The dashboard reports stopped, starting, running, and error states; every eligible loopback, private LAN, and Tailscale address; active listeners; firewall and Tailscale health; recent server events; and copyable diagnostics. Closing the window keeps the server in the system tray. **Quit and stop server** in the tray gracefully stops listeners and job dispatch before exiting.
 
@@ -117,4 +119,4 @@ This is deliberately not the future client persistence layer. Phase 1 stores no 
 
 ## Validation
 
-Server tests cover configuration safety, simultaneous listeners, clean stop/restart, migrations, idempotency conflicts, cancellation, state/event transactions, restart recovery, progress preservation, HTTP capability/error behavior, and WebSocket replay plus live delivery. Dashboard tests cover address grouping and Tailscale setup states. Client tests cover profile storage/validation, address construction, state transitions, retries, capability retrieval, and protocol mismatch reporting. Run the repository-prescribed suite with `pnpm check`; use `pnpm build:server-dashboard:web` for local dashboard validation and `pnpm build:server:windows` on Windows for the NSIS installer.
+Server tests cover configuration safety, simultaneous listeners, clean stop/restart, migrations, idempotency conflicts, cancellation, state/event transactions, restart recovery, progress preservation, HTTP capability/error behavior, and WebSocket replay plus live delivery. Dashboard tests cover address grouping, Tailscale setup states, Ollama state classification, and the fixed loopback endpoint. Client tests cover profile storage/validation, address construction, state transitions, retries, capability retrieval, and protocol mismatch reporting. Run the repository-prescribed suite with `pnpm check`; use `pnpm build:server-dashboard:web` for local dashboard validation and `pnpm build:server:windows` on Windows for the NSIS installer.

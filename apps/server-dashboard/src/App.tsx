@@ -2,8 +2,10 @@ import { isTauri, invoke } from '@tauri-apps/api/core';
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AddressView,
+  OllamaState,
   TailscaleState,
   groupAddresses,
+  ollamaPresentation,
   tailscaleMessage,
 } from './dashboard';
 import {
@@ -39,6 +41,7 @@ interface DashboardSnapshot {
   first_run: boolean;
   addresses: AddressView[];
   tailscale: TailscaleState;
+  ollama: OllamaState;
   firewall_status: string;
   network_change_pending: boolean;
   data_directory: string;
@@ -84,6 +87,11 @@ const preview: DashboardSnapshot = {
     },
   ],
   tailscale: { state: 'connected', hostname: 'studio.tailnet.ts.net' },
+  ollama: {
+    state: 'ready',
+    version: '0.12.3',
+    capability: 'version_api',
+  },
   firewall_status: 'Configured',
   network_change_pending: false,
   data_directory: 'C:\\Users\\you\\AppData\\Local\\Tome Server\\data',
@@ -172,6 +180,71 @@ function Toggle({
         <small>{detail}</small>
       </span>
     </label>
+  );
+}
+
+function OllamaSetup({
+  ollama,
+  busy,
+  compact = false,
+  onRun,
+}: {
+  ollama: OllamaState;
+  busy: boolean;
+  compact?: boolean;
+  onRun: (command: string) => void;
+}) {
+  const presentation = ollamaPresentation(ollama);
+  const action = presentation.action;
+  const commandName =
+    action === 'start'
+      ? 'start_ollama'
+      : action === 'retry'
+        ? 'get_dashboard'
+        : 'open_ollama_download_page';
+  const actionLabel =
+    action === 'start'
+      ? 'Start Ollama'
+      : action === 'retry'
+        ? 'Check again'
+        : 'Get Ollama from official site';
+  return (
+    <section className={`ollama-card ${compact ? 'compact' : ''}`}>
+      <div className="ollama-heading">
+        <div>
+          <span className="eyebrow">LOCAL AI RUNTIME</span>
+          <h2>{presentation.title}</h2>
+        </div>
+        <span className={`runtime-state ${presentation.tone}`}>
+          {presentation.tone === 'ready' ? 'Ready' : 'Action needed'}
+        </span>
+      </div>
+      <p>{presentation.detail}</p>
+      <div className="loopback-note">
+        <strong>Private by design</strong>
+        <span>
+          Tome contacts Ollama only at <code>127.0.0.1:11434</code>. Ollama is
+          never exposed to LAN or Tailscale devices.
+        </span>
+      </div>
+      {action && (
+        <button
+          className="primary-button"
+          disabled={busy}
+          onClick={() => onRun(commandName)}
+          type="button"
+        >
+          {actionLabel}
+        </button>
+      )}
+      {action === 'install' && (
+        <small className="consent-note">
+          Opens Ollama’s official Windows download page. You choose whether to
+          download and run its normal installer; Tome never runs a remote script
+          or installs it silently.
+        </small>
+      )}
+    </section>
   );
 }
 
@@ -309,6 +382,11 @@ export function App() {
         </section>
         <div className="content-grid">
           <div className="main-column">
+            <OllamaSetup
+              busy={busy}
+              ollama={snapshot.ollama}
+              onRun={(name) => void run(name)}
+            />
             <ModelSetup
               port={snapshot.settings.port}
               running={snapshot.status === 'running'}
@@ -471,6 +549,12 @@ export function App() {
               Tome binds only to the specific private addresses you enable. It
               never opens a wildcard or public listener.
             </p>
+            <OllamaSetup
+              busy={busy}
+              compact
+              ollama={snapshot.ollama}
+              onRun={(name) => void run(name)}
+            />
             <div className="setup-options">
               <Toggle
                 checked={draft.lan_enabled}

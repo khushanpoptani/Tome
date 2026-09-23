@@ -4,7 +4,8 @@ use std::{
     collections::VecDeque,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,10 @@ use tome_server::{
 
 const DEFAULT_PORT: u16 = 7331;
 const MAX_LOGS: usize = 100;
+const OLLAMA_API_BASE: &str = "http://127.0.0.1:11434";
+const OLLAMA_VERSION_URL: &str = "http://127.0.0.1:11434/api/version";
+const OLLAMA_LOOPBACK_HOST: &str = "127.0.0.1:11434";
+const OLLAMA_WINDOWS_DOWNLOAD_PAGE: &str = "https://ollama.com/download/windows";
 #[cfg(windows)]
 const LAN_RULE: &str = "Tome Server (Private LAN)";
 #[cfg(windows)]
@@ -79,6 +84,50 @@ enum TailscaleState {
     NoAddress,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum OllamaState {
+    NotInstalled,
+    InstalledNotRunning {
+        installed_version: Option<String>,
+    },
+    Ready {
+        version: String,
+        capability: &'static str,
+    },
+    Incompatible {
+        message: String,
+    },
+    Unreachable {
+        message: String,
+    },
+    InstallFailed {
+        message: String,
+    },
+    StartFailed {
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OllamaApiProbe {
+    Ready(String),
+    Incompatible(String),
+    NotRunning,
+    Unreachable(String),
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaVersionResponse {
+    version: String,
+}
+
+#[derive(Debug, Clone)]
+struct OllamaInstallation {
+    executable: PathBuf,
+    version: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct DashboardSnapshot {
     status: ServerStatus,
@@ -87,6 +136,7 @@ struct DashboardSnapshot {
     first_run: bool,
     addresses: Vec<AddressView>,
     tailscale: TailscaleState,
+    ollama: OllamaState,
     firewall_status: String,
     network_change_pending: bool,
     data_directory: String,
@@ -104,6 +154,7 @@ struct InnerState {
     server: Option<ServerHandle>,
     active_addresses: Vec<IpAddr>,
     logs: VecDeque<LogEntry>,
+    ollama_action_failure: Option<OllamaState>,
 }
 
 struct DashboardState {
@@ -212,6 +263,89 @@ fn open_data_directory(state: State<'_, DashboardState>) -> Result<(), String> {
     open_directory(&path)
 }
 
+#[tauri::command]
+async fn open_ollama_download_page(
+    state: State<'_, DashboardState>,
+) -> Result<DashboardSnapshot, String> {
+    let result = open_url(OLLAMA_WINDOWS_DOWNLOAD_PAGE);
+    {
+        let mut inner = state.inner.lock().await;
+        match result {
+            Ok(()) => {
+                inner.ollama_action_failure = None;
+                push_log(
+                    &mut inner,
+                    "info",
+                    "Opened the official Ollama for Windows download page.",
+                );
+            }
+            Err(error) => {
+                let message = format!(
+                    "Could not open the official Ollama download page: {error}. Open https://ollama.com/download/windows in a browser."
+                );
+                inner.ollama_action_failure = Some(OllamaState::InstallFailed {
+                    message: message.clone(),
+                });
+                push_log(&mut inner, "error", &message);
+            }
+        }
+    }
+    snapshot(&state).await
+}
+
+#[tauri::command]
+async fn start_ollama(state: State<'_, DashboardState>) -> Result<DashboardSnapshot, String> {
+    let Some(installation) = detect_ollama_installation() else {
+        let mut inner = state.inner.lock().await;
+        let message =
+            "Ollama is not installed. Install it from the official Ollama distribution first."
+                .to_owned();
+        inner.ollama_action_failure = Some(OllamaState::StartFailed {
+            message: message.clone(),
+        });
+        push_log(&mut inner, "error", &message);
+        drop(inner);
+        return snapshot(&state).await;
+    };
+
+    let result = spawn_ollama_loopback(&installation.executable);
+    if let Err(error) = result {
+        let mut inner = state.inner.lock().await;
+        let message = format!("Could not start Ollama: {error}");
+        inner.ollama_action_failure = Some(OllamaState::StartFailed {
+            message: message.clone(),
+        });
+        push_log(&mut inner, "error", &message);
+        drop(inner);
+        return snapshot(&state).await;
+    }
+
+    for _ in 0..12 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if matches!(probe_ollama_api().await, OllamaApiProbe::Ready(_)) {
+            let mut inner = state.inner.lock().await;
+            inner.ollama_action_failure = None;
+            push_log(
+                &mut inner,
+                "info",
+                "Started Ollama on the loopback-only endpoint 127.0.0.1:11434.",
+            );
+            drop(inner);
+            return snapshot(&state).await;
+        }
+    }
+
+    let mut inner = state.inner.lock().await;
+    let message = "Ollama was launched but its loopback API did not become ready. Check the Ollama logs and try again."
+        .to_owned();
+    inner.ollama_action_failure = Some(OllamaState::StartFailed {
+        message: message.clone(),
+    });
+    push_log(&mut inner, "error", &message);
+    drop(inner);
+    snapshot(&state).await
+}
+
 async fn start_server_inner(state: &DashboardState) -> Result<(), String> {
     let (settings, first_run) = {
         let mut inner = state.inner.lock().await;
@@ -296,7 +430,15 @@ async fn snapshot(state: &DashboardState) -> Result<DashboardSnapshot, String> {
     let interfaces = enumerate_addresses().map_err(|error| error.to_string())?;
     let tailscale = detect_tailscale(&interfaces);
     let firewall_status = firewall_status();
-    let inner = state.inner.lock().await;
+    let detected_ollama = detect_ollama().await;
+    let mut inner = state.inner.lock().await;
+    if matches!(detected_ollama, OllamaState::Ready { .. }) {
+        inner.ollama_action_failure = None;
+    }
+    let ollama = inner
+        .ollama_action_failure
+        .clone()
+        .unwrap_or(detected_ollama);
     let selected = select_listener_addresses(
         &interfaces,
         ListenerSelection {
@@ -329,7 +471,7 @@ async fn snapshot(state: &DashboardState) -> Result<DashboardSnapshot, String> {
                 .iter()
                 .any(|address| !inner.active_addresses.contains(address)));
     let diagnostics = format!(
-        "Tome Server {}\nProtocol {}\nStatus: {:?}\nPort: {}\nListeners: {:?}\nFirewall: {}\nTailscale: {:?}\nData: {}",
+        "Tome Server {}\nProtocol {}\nStatus: {:?}\nPort: {}\nListeners: {:?}\nFirewall: {}\nTailscale: {:?}\nOllama endpoint: {}\nOllama: {:?}\nData: {}",
         env!("CARGO_PKG_VERSION"),
         PROTOCOL_VERSION,
         inner.status,
@@ -337,6 +479,8 @@ async fn snapshot(state: &DashboardState) -> Result<DashboardSnapshot, String> {
         inner.active_addresses,
         firewall_status,
         tailscale,
+        OLLAMA_API_BASE,
+        ollama,
         inner.settings.data_directory.display()
     );
     Ok(DashboardSnapshot {
@@ -346,6 +490,7 @@ async fn snapshot(state: &DashboardState) -> Result<DashboardSnapshot, String> {
         first_run: inner.first_run,
         addresses,
         tailscale,
+        ollama,
         firewall_status,
         network_change_pending,
         data_directory: inner.settings.data_directory.display().to_string(),
@@ -354,6 +499,145 @@ async fn snapshot(state: &DashboardState) -> Result<DashboardSnapshot, String> {
         logs: inner.logs.iter().cloned().collect(),
         diagnostics,
     })
+}
+
+async fn detect_ollama() -> OllamaState {
+    let installation = detect_ollama_installation();
+    classify_ollama_state(
+        installation.is_some(),
+        installation.as_ref().and_then(|item| item.version.clone()),
+        probe_ollama_api().await,
+    )
+}
+
+fn classify_ollama_state(
+    installed: bool,
+    installed_version: Option<String>,
+    probe: OllamaApiProbe,
+) -> OllamaState {
+    match probe {
+        OllamaApiProbe::Ready(version) => OllamaState::Ready {
+            version,
+            capability: "version_api",
+        },
+        OllamaApiProbe::Incompatible(message) => OllamaState::Incompatible { message },
+        OllamaApiProbe::NotRunning if installed => {
+            OllamaState::InstalledNotRunning { installed_version }
+        }
+        OllamaApiProbe::NotRunning => OllamaState::NotInstalled,
+        OllamaApiProbe::Unreachable(message) => OllamaState::Unreachable { message },
+    }
+}
+
+async fn probe_ollama_api() -> OllamaApiProbe {
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(500))
+        .timeout(Duration::from_millis(1_500))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => return OllamaApiProbe::Unreachable(error.to_string()),
+    };
+    let response = match client.get(OLLAMA_VERSION_URL).send().await {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return OllamaApiProbe::NotRunning,
+        Err(error) => {
+            return OllamaApiProbe::Unreachable(format!(
+                "The local Ollama endpoint could not be reached: {error}"
+            ));
+        }
+    };
+    if !response.status().is_success() {
+        return OllamaApiProbe::Incompatible(format!(
+            "The local service returned HTTP {} from /api/version.",
+            response.status()
+        ));
+    }
+    match response.json::<OllamaVersionResponse>().await {
+        Ok(body) if !body.version.trim().is_empty() => {
+            OllamaApiProbe::Ready(body.version.trim().to_owned())
+        }
+        Ok(_) | Err(_) => OllamaApiProbe::Incompatible(
+            "The local service did not return a valid Ollama version response.".to_owned(),
+        ),
+    }
+}
+
+fn detect_ollama_installation() -> Option<OllamaInstallation> {
+    ollama_executable_candidates().into_iter().find_map(|path| {
+        if !path.is_file() {
+            return None;
+        }
+        let version = ollama_cli_version(&path);
+        Some(OllamaInstallation {
+            executable: path,
+            version,
+        })
+    })
+}
+
+fn ollama_executable_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        paths.push(
+            PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("Ollama")
+                .join("ollama.exe"),
+        );
+    }
+    #[cfg(windows)]
+    if let Ok(output) = hidden_command("where.exe", &["ollama.exe"]).output() {
+        paths.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    #[cfg(not(windows))]
+    if let Ok(output) = hidden_command("which", &["ollama"]).output() {
+        paths.extend(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    paths
+}
+
+fn ollama_cli_version(executable: &Path) -> Option<String> {
+    let output = path_command(executable, &["--version"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.split_whitespace()
+        .rev()
+        .find(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+        })
+        .map(|part| part.trim_end_matches(',').to_owned())
+}
+
+fn spawn_ollama_loopback(executable: &Path) -> Result<(), String> {
+    path_command(executable, &["serve"])
+        .env("OLLAMA_HOST", OLLAMA_LOOPBACK_HOST)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn detect_tailscale(addresses: &[NetworkAddress]) -> TailscaleState {
@@ -445,6 +729,21 @@ fn hidden_command(program: &str, arguments: &[&str]) -> Command {
     use std::os::windows::process::CommandExt;
     let mut command = Command::new(program);
     command.args(arguments).creation_flags(0x0800_0000);
+    command
+}
+
+#[cfg(windows)]
+fn path_command(program: &Path, arguments: &[&str]) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new(program);
+    command.args(arguments).creation_flags(0x0800_0000);
+    command
+}
+
+#[cfg(not(windows))]
+fn path_command(program: &Path, arguments: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    command.args(arguments);
     command
 }
 
@@ -567,6 +866,33 @@ fn open_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(windows)]
+fn open_url(url: &str) -> Result<(), String> {
+    Command::new("explorer.exe")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn open_url(url: &str) -> Result<(), String> {
+    Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn open_url(url: &str) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(not(windows))]
 fn open_directory(path: &Path) -> Result<(), String> {
     Command::new("open")
@@ -640,6 +966,7 @@ fn main() {
                     server: None,
                     active_addresses: Vec::new(),
                     logs,
+                    ollama_action_failure: None,
                 }),
             });
 
@@ -690,6 +1017,8 @@ fn main() {
             restart_server,
             configure_firewall,
             open_data_directory,
+            open_ollama_download_page,
+            start_ollama,
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Tome Server dashboard");
@@ -736,5 +1065,61 @@ mod tests {
                 hostname: Some("studio.tailnet.ts.net".to_owned())
             }
         );
+    }
+
+    #[test]
+    fn ollama_probe_distinguishes_required_setup_states() {
+        assert_eq!(
+            classify_ollama_state(false, None, OllamaApiProbe::NotRunning),
+            OllamaState::NotInstalled
+        );
+        assert_eq!(
+            classify_ollama_state(true, Some("0.12.3".to_owned()), OllamaApiProbe::NotRunning),
+            OllamaState::InstalledNotRunning {
+                installed_version: Some("0.12.3".to_owned())
+            }
+        );
+        assert_eq!(
+            classify_ollama_state(false, None, OllamaApiProbe::Ready("0.12.3".to_owned())),
+            OllamaState::Ready {
+                version: "0.12.3".to_owned(),
+                capability: "version_api"
+            }
+        );
+        assert!(matches!(
+            classify_ollama_state(
+                true,
+                Some("0.12.3".to_owned()),
+                OllamaApiProbe::Incompatible("unexpected response".to_owned())
+            ),
+            OllamaState::Incompatible { .. }
+        ));
+        assert!(matches!(
+            classify_ollama_state(
+                true,
+                Some("0.12.3".to_owned()),
+                OllamaApiProbe::Unreachable("timed out".to_owned())
+            ),
+            OllamaState::Unreachable { .. }
+        ));
+    }
+
+    #[test]
+    fn ollama_probe_is_pinned_to_loopback() {
+        assert_eq!(OLLAMA_API_BASE, "http://127.0.0.1:11434");
+        assert_eq!(OLLAMA_VERSION_URL, "http://127.0.0.1:11434/api/version");
+        assert_eq!(OLLAMA_LOOPBACK_HOST, "127.0.0.1:11434");
+        assert!(!OLLAMA_API_BASE.contains("0.0.0.0"));
+        assert!(!OLLAMA_API_BASE.contains("tailscale"));
+    }
+
+    #[test]
+    fn official_ollama_install_action_is_not_a_remote_script() {
+        assert_eq!(
+            OLLAMA_WINDOWS_DOWNLOAD_PAGE,
+            "https://ollama.com/download/windows"
+        );
+        assert!(!OLLAMA_WINDOWS_DOWNLOAD_PAGE.contains("install.ps1"));
+        assert!(!OLLAMA_WINDOWS_DOWNLOAD_PAGE.contains("OllamaSetup.exe"));
     }
 }

@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { groupAddresses, tailscaleMessage } from './dashboard';
+import {
+  groupAddresses,
+  ollamaPresentation,
+  tailscaleMessage,
+} from './dashboard';
 
 describe('dashboard helpers', () => {
   it('shows LAN and Tailscale listeners at the same time', () => {
@@ -31,5 +35,30 @@ describe('dashboard helpers', () => {
     expect(tailscaleMessage({ state: 'not_signed_in' })).toContain(
       'not signed in',
     );
+  });
+
+  it('makes every Ollama setup state actionable', () => {
+    expect(ollamaPresentation({ state: 'not_installed' }).action).toBe(
+      'install',
+    );
+    expect(
+      ollamaPresentation({
+        state: 'installed_not_running',
+        installed_version: '0.12.3',
+      }).action,
+    ).toBe('start');
+    expect(
+      ollamaPresentation({
+        state: 'ready',
+        version: '0.12.3',
+        capability: 'version_api',
+      }),
+    ).toMatchObject({ tone: 'ready', action: null });
+    expect(
+      ollamaPresentation({ state: 'unreachable', message: 'timed out' }).action,
+    ).toBe('retry');
+    expect(
+      ollamaPresentation({ state: 'start_failed', message: 'blocked' }).action,
+    ).toBe('start');
   });
 });
