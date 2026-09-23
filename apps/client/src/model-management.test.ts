@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { formatBytes, loadModelSnapshot } from './model-management';
+import {
+  formatBytes,
+  loadModelSnapshot,
+  searchModels,
+  startDownload,
+  type ModelCandidate,
+} from './model-management';
 import type { ConnectionProfile } from './connection';
 
 const profile: ConnectionProfile = {
@@ -48,5 +54,51 @@ describe('remote model management', () => {
     );
     const snapshot = await loadModelSnapshot(profile);
     expect(snapshot.jobs.map((job) => job.id)).toEqual(['download']);
+  });
+
+  it('encodes aliases for provider search', async () => {
+    const fetcher = vi.fn((input: string | URL | Request) => {
+      void input;
+      return Promise.resolve(
+        new Response(
+          JSON.stringify({
+            provider: 'hugging_face',
+            query: 'llama3.2:3b',
+            normalized_query: 'Llama 3.2 3B GGUF',
+            candidates: [],
+          }),
+          { status: 200 },
+        ),
+      );
+    });
+    vi.stubGlobal('fetch', fetcher);
+    await searchModels(profile, 'llama3.2:3b');
+    expect(String(fetcher.mock.calls[0]?.[0])).toContain('q=llama3.2%3A3b');
+  });
+
+  it('submits exact immutable artifact identity without a URL', async () => {
+    let submitted: Record<string, unknown> = {};
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: string | URL | Request, init?: RequestInit) => {
+        submitted = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return Promise.resolve(new Response('{}', { status: 200 }));
+      }),
+    );
+    const candidate = {
+      candidate_id: 'hf-id',
+      provider: 'hugging_face',
+      repository: 'owner/model',
+      revision: '0'.repeat(40),
+      artifact: 'model-Q4_K_M.gguf',
+    } as ModelCandidate;
+    await startDownload(profile, candidate);
+    expect(submitted).toMatchObject({
+      provider: 'hugging_face',
+      repository: 'owner/model',
+      revision: '0'.repeat(40),
+      artifact: 'model-Q4_K_M.gguf',
+    });
+    expect(submitted).not.toHaveProperty('download_url');
   });
 });

@@ -55,6 +55,8 @@ pub enum ModelError {
     RuntimeUnavailable(String),
     #[error("model runtime failed: {0}")]
     Runtime(String),
+    #[error("model provider request failed: {0}")]
+    Provider(String),
     #[error("time formatting failed: {0}")]
     Time(#[from] time::error::Format),
     #[error("database operation failed")]
@@ -125,7 +127,16 @@ pub struct ProfileAssessment {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DownloadSubmission {
-    pub catalog_id: String,
+    #[serde(default)]
+    pub catalog_id: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub artifact: Option<String>,
     pub idempotency_key: String,
     #[serde(default)]
     pub license_accepted: bool,
@@ -161,7 +172,23 @@ impl ModelManager {
             .connect_timeout(Duration::from_secs(15))
             .read_timeout(Duration::from_secs(30))
             .timeout(Duration::from_hours(6))
-            .redirect(reqwest::redirect::Policy::limited(5))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    return attempt.error("too many provider redirects");
+                }
+                let allowed = attempt.url().host_str().is_some_and(|host| {
+                    host == "huggingface.co"
+                        || host.ends_with(".huggingface.co")
+                        || host == "hf.co"
+                        || host.ends_with(".hf.co")
+                        || host.ends_with(".xethub.hf.co")
+                });
+                if allowed {
+                    attempt.follow()
+                } else {
+                    attempt.error("provider redirect target is not allowlisted")
+                }
+            }))
             .user_agent(concat!("Tome/", env!("CARGO_PKG_VERSION")))
             .build()?;
         let manager = Self {
@@ -185,6 +212,13 @@ impl ModelManager {
 
     pub async fn hardware(&self) -> HardwareCapabilities {
         self.hardware.read().await.clone()
+    }
+
+    pub async fn search_models(
+        &self,
+        query: &str,
+    ) -> Result<crate::providers::ModelSearchResponse, ModelError> {
+        crate::providers::search(&self.client, query, &self.hardware().await).await
     }
 
     pub async fn refresh_hardware(&self) -> Result<HardwareCapabilities, ModelError> {
@@ -245,10 +279,28 @@ impl ModelManager {
                 "idempotency_key must contain 1 to 128 characters".to_owned(),
             ));
         }
-        let entry = self
-            .catalog
-            .entry(&request.catalog_id)
-            .ok_or(ModelError::CatalogEntryNotFound)?;
+        let entry = if let Some(catalog_id) = request.catalog_id.as_deref() {
+            self.catalog
+                .entry(catalog_id)
+                .cloned()
+                .ok_or(ModelError::CatalogEntryNotFound)?
+        } else {
+            let selection = crate::providers::ArtifactSelection {
+                provider: request
+                    .provider
+                    .ok_or_else(|| ModelError::Invalid("provider is required".to_owned()))?,
+                repository: request
+                    .repository
+                    .ok_or_else(|| ModelError::Invalid("repository is required".to_owned()))?,
+                revision: request
+                    .revision
+                    .ok_or_else(|| ModelError::Invalid("revision is required".to_owned()))?,
+                artifact: request
+                    .artifact
+                    .ok_or_else(|| ModelError::Invalid("artifact is required".to_owned()))?,
+            };
+            crate::providers::resolve(&self.client, &selection, &self.hardware().await).await?
+        };
         if entry.access != "public" {
             return Err(ModelError::Invalid(
                 "restricted artifacts require OS-backed credential storage, which is not enabled"
@@ -276,7 +328,11 @@ impl ModelManager {
             .create_job(CreateJob {
                 idempotency_key: request.idempotency_key,
                 job_type: JobType::ModelDownload,
-                input: json!({ "catalog_id": request.catalog_id }),
+                input: json!({
+                    "catalog_id": entry.id,
+                    "display_name": entry.name,
+                    "resolved_artifact": entry,
+                }),
                 parent_job_id: None,
                 retry_of_job_id: None,
             })
@@ -285,18 +341,21 @@ impl ModelManager {
 
     #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
     pub async fn execute_download(&self, job: &Job) -> Result<Value, ModelError> {
-        let catalog_id = job
-            .input
-            .get("catalog_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                ModelError::Invalid("model_download input requires catalog_id".to_owned())
-            })?;
-        let entry = self
-            .catalog
-            .entry(catalog_id)
-            .cloned()
-            .ok_or(ModelError::CatalogEntryNotFound)?;
+        let entry = if let Some(value) = job.input.get("resolved_artifact") {
+            serde_json::from_value::<CatalogEntry>(value.clone())?
+        } else {
+            let catalog_id = job
+                .input
+                .get("catalog_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ModelError::Invalid("model_download input requires catalog_id".to_owned())
+                })?;
+            self.catalog
+                .entry(catalog_id)
+                .cloned()
+                .ok_or(ModelError::CatalogEntryNotFound)?
+        };
         let safe_name = safe_component(&entry.id)?;
         let part_path = self.temp_root.join(format!("{safe_name}.part"));
         let final_directory = self.model_root.join(safe_name);
@@ -307,8 +366,12 @@ impl ModelManager {
         self.assert_contained(&final_path, &self.model_root, false)
             .await?;
 
-        if final_path.is_file() && verify_file(&final_path, &entry).await.is_ok() {
-            let model = self.register(&entry, &final_path).await?;
+        if final_path.is_file()
+            && let Ok(inspection) = verify_file(&final_path, &entry).await
+        {
+            let mut inspected_entry = entry.clone();
+            inspection.apply(&mut inspected_entry);
+            let model = self.register(&inspected_entry, &final_path).await?;
             return Ok(json!({ "model_id": model.id, "already_present": true }));
         }
         let existing = fs::metadata(&part_path)
@@ -423,12 +486,14 @@ impl ModelManager {
                 entry.bytes
             )));
         }
-        verify_file(&part_path, &entry).await?;
+        let inspection = verify_file(&part_path, &entry).await?;
         if final_path.exists() {
             fs::remove_file(&final_path).await?;
         }
         fs::rename(&part_path, &final_path).await?;
-        let model = self.register(&entry, &final_path).await?;
+        let mut inspected_entry = entry.clone();
+        inspection.apply(&mut inspected_entry);
+        let model = self.register(&inspected_entry, &final_path).await?;
         Ok(json!({ "model_id": model.id, "bytes": entry.bytes, "verified": true }))
     }
 
@@ -641,16 +706,17 @@ impl ModelManager {
         &self,
         hardware: &HardwareCapabilities,
     ) -> Result<(), ModelError> {
-        for entry in &self.catalog.entries {
-            let (state, reason) = compatibility(entry, hardware);
+        for model in self.inventory().await?.models {
+            let (state, reason) =
+                compatibility_values(model.format == "gguf", model.estimated_ram_bytes, hardware);
             sqlx::query(
                 "UPDATE model_artifacts SET compatibility_state = ?, compatibility_reason = ?,
-                 updated_at = ? WHERE catalog_id = ? AND verification_state = 'verified'",
+                 updated_at = ? WHERE id = ? AND verification_state = 'verified'",
             )
             .bind(state)
             .bind(reason)
             .bind(now()?)
-            .bind(&entry.id)
+            .bind(&model.id)
             .execute(&self.store.pool)
             .await?;
         }
@@ -681,7 +747,20 @@ impl ModelManager {
         let hardware = self.hardware().await;
         let (state, reason) = compatibility(entry, &hardware);
         let timestamp = now()?;
-        let id = format!("catalog:{}", entry.id);
+        let id = format!(
+            "{}:{}",
+            if entry.provider == "hugging_face" {
+                "model"
+            } else {
+                "catalog"
+            },
+            entry.id
+        );
+        let catalog_version = if entry.provider == "hugging_face" {
+            format!("hugging-face:{}", entry.revision)
+        } else {
+            self.catalog.catalog_version.clone()
+        };
         sqlx::query(
             "INSERT INTO model_artifacts
              (id, catalog_id, logical_model_id, display_name, catalog_version, provider, repository,
@@ -696,7 +775,7 @@ impl ModelManager {
               updated_at = excluded.updated_at",
         )
         .bind(&id).bind(&entry.id).bind(format!("{}/{}", entry.repository, entry.revision))
-        .bind(&entry.name).bind(&self.catalog.catalog_version).bind(&entry.provider).bind(&entry.repository)
+        .bind(&entry.name).bind(catalog_version).bind(&entry.provider).bind(&entry.repository)
         .bind(&entry.revision).bind(&entry.artifact).bind(&entry.format).bind(&entry.quantization)
         .bind(to_i64(entry.bytes, "artifact bytes")?).bind(&entry.sha256).bind(path.display().to_string())
         .bind(serde_json::to_string(&entry.capabilities)?).bind(state).bind(reason)
@@ -778,14 +857,26 @@ impl ModelManager {
 }
 
 fn compatibility(entry: &CatalogEntry, hardware: &HardwareCapabilities) -> (&'static str, String) {
-    if entry.runtime_status == RuntimeStatus::CatalogOnly {
+    compatibility_values(
+        entry.runtime_status != RuntimeStatus::CatalogOnly,
+        entry.estimated_ram_bytes,
+        hardware,
+    )
+}
+
+fn compatibility_values(
+    executable: bool,
+    estimated_ram_bytes: u64,
+    hardware: &HardwareCapabilities,
+) -> (&'static str, String) {
+    if !executable {
         return (
             "catalog_only",
             "Cataloged for a future runtime adapter; Tome cannot execute this artifact in Phase 2."
                 .to_owned(),
         );
     }
-    if entry.estimated_ram_bytes > hardware.total_memory_bytes {
+    if estimated_ram_bytes > hardware.total_memory_bytes {
         return (
             "incompatible",
             "Estimated RAM exceeds detected system RAM.".to_owned(),
@@ -854,7 +945,36 @@ impl RuntimeAdapter for LlamaCppAdapter {
     }
 }
 
-async fn verify_file(path: &Path, entry: &CatalogEntry) -> Result<(), ModelError> {
+#[derive(Debug, Default)]
+struct ArtifactInspection {
+    name: Option<String>,
+    context_limit: Option<u32>,
+    tokenizer: Option<String>,
+    chat_template: Option<String>,
+    quantization: Option<String>,
+}
+
+impl ArtifactInspection {
+    fn apply(self, entry: &mut CatalogEntry) {
+        if let Some(value) = self.name {
+            entry.name = value;
+        }
+        if let Some(value) = self.context_limit {
+            entry.context_limit = value;
+        }
+        if let Some(value) = self.tokenizer {
+            entry.tokenizer = value;
+        }
+        if let Some(value) = self.chat_template {
+            entry.chat_template = Some(value);
+        }
+        if let Some(value) = self.quantization {
+            entry.quantization = value;
+        }
+    }
+}
+
+async fn verify_file(path: &Path, entry: &CatalogEntry) -> Result<ArtifactInspection, ModelError> {
     let metadata = fs::metadata(path).await?;
     if !metadata.is_file() || metadata.len() != entry.bytes {
         return Err(ModelError::Verification(format!(
@@ -864,15 +984,34 @@ async fn verify_file(path: &Path, entry: &CatalogEntry) -> Result<(), ModelError
         )));
     }
     let mut file = fs::File::open(path).await?;
-    let mut header = [0_u8; 8];
+    let mut header = [0_u8; 24];
     let read = file.read(&mut header).await?;
-    if entry.format == "gguf" && (read < 4 || &header[..4] != b"GGUF") {
-        return Err(ModelError::Verification(
-            "artifact does not contain a GGUF header".to_owned(),
-        ));
+    let mut inspection = ArtifactInspection::default();
+    if entry.format == "gguf" {
+        if read < 24 || &header[..4] != b"GGUF" {
+            return Err(ModelError::Verification(
+                "artifact does not contain a complete GGUF header".to_owned(),
+            ));
+        }
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        let tensor_count = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let metadata_count = u64::from_le_bytes(header[16..24].try_into().unwrap());
+        if !matches!(version, 2 | 3) || tensor_count == 0 || metadata_count > 1_000_000 {
+            return Err(ModelError::Verification(
+                "GGUF header has an unsupported version or implausible counts".to_owned(),
+            ));
+        }
+        file.rewind().await?;
+        let mut metadata = Vec::new();
+        (&mut file)
+            .take(8 * 1024 * 1024)
+            .read_to_end(&mut metadata)
+            .await?;
+        inspection = inspect_gguf_metadata(&metadata, metadata_count);
     }
     if entry.format == "safetensors"
-        && (read < 8 || u64::from_le_bytes(header) > entry.bytes.saturating_sub(8))
+        && (read < 8
+            || u64::from_le_bytes(header[..8].try_into().unwrap()) > entry.bytes.saturating_sub(8))
     {
         return Err(ModelError::Verification(
             "artifact does not contain a bounded safetensors header".to_owned(),
@@ -895,7 +1034,148 @@ async fn verify_file(path: &Path, entry: &CatalogEntry) -> Result<(), ModelError
             entry.sha256
         )));
     }
-    Ok(())
+    Ok(inspection)
+}
+
+fn inspect_gguf_metadata(bytes: &[u8], count: u64) -> ArtifactInspection {
+    let mut cursor = 24_usize;
+    let mut result = ArtifactInspection::default();
+    for _ in 0..count {
+        let Some(key) = read_gguf_string(bytes, &mut cursor) else {
+            break;
+        };
+        let Some(kind) = read_u32(bytes, &mut cursor) else {
+            break;
+        };
+        match kind {
+            8 => {
+                let Some(value) = read_gguf_string(bytes, &mut cursor) else {
+                    break;
+                };
+                match key.as_str() {
+                    "general.name" => result.name = Some(value),
+                    "tokenizer.ggml.model" => result.tokenizer = Some(value),
+                    "tokenizer.chat_template" => result.chat_template = Some(value),
+                    _ => {}
+                }
+            }
+            4 => {
+                let Some(value) = read_u32(bytes, &mut cursor) else {
+                    break;
+                };
+                if key.ends_with(".context_length") {
+                    result.context_limit = Some(value);
+                } else if key == "general.file_type" {
+                    result.quantization = gguf_file_type(value).map(str::to_owned);
+                }
+            }
+            10 => {
+                let Some(value) = read_u64(bytes, &mut cursor) else {
+                    break;
+                };
+                if key.ends_with(".context_length") {
+                    result.context_limit = u32::try_from(value).ok();
+                }
+            }
+            9 => {
+                let Some(element) = read_u32(bytes, &mut cursor) else {
+                    break;
+                };
+                let Some(length) = read_u64(bytes, &mut cursor) else {
+                    break;
+                };
+                if !skip_gguf_array(bytes, &mut cursor, element, length) {
+                    break;
+                }
+            }
+            other => {
+                let width = match other {
+                    0 | 1 | 7 => 1,
+                    2 | 3 => 2,
+                    4..=6 => 4,
+                    10..=12 => 8,
+                    _ => break,
+                };
+                let Some(next) = cursor.checked_add(width) else {
+                    break;
+                };
+                if next > bytes.len() {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+    }
+    result
+}
+
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    let end = cursor.checked_add(4)?;
+    let value = u32::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    Some(value)
+}
+
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let end = cursor.checked_add(8)?;
+    let value = u64::from_le_bytes(bytes.get(*cursor..end)?.try_into().ok()?);
+    *cursor = end;
+    Some(value)
+}
+
+fn read_gguf_string(bytes: &[u8], cursor: &mut usize) -> Option<String> {
+    let length = usize::try_from(read_u64(bytes, cursor)?).ok()?;
+    let end = cursor.checked_add(length)?;
+    let value = String::from_utf8(bytes.get(*cursor..end)?.to_vec()).ok()?;
+    *cursor = end;
+    Some(value)
+}
+
+fn skip_gguf_array(bytes: &[u8], cursor: &mut usize, kind: u32, length: u64) -> bool {
+    if kind == 8 {
+        for _ in 0..length {
+            if read_gguf_string(bytes, cursor).is_none() {
+                return false;
+            }
+        }
+        return true;
+    }
+    let width = match kind {
+        0 | 1 | 7 => 1_u64,
+        2 | 3 => 2,
+        4..=6 => 4,
+        10..=12 => 8,
+        _ => return false,
+    };
+    let Some(skip) = length
+        .checked_mul(width)
+        .and_then(|value| usize::try_from(value).ok())
+    else {
+        return false;
+    };
+    let Some(end) = cursor.checked_add(skip) else {
+        return false;
+    };
+    if end > bytes.len() {
+        return false;
+    }
+    *cursor = end;
+    true
+}
+
+fn gguf_file_type(value: u32) -> Option<&'static str> {
+    match value {
+        1 => Some("F16"),
+        2 => Some("Q4_0"),
+        6 => Some("Q5_0"),
+        8 => Some("Q8_0"),
+        10 => Some("Q2_K"),
+        12 => Some("Q3_K_M"),
+        15 => Some("Q4_K_M"),
+        17 => Some("Q5_K_M"),
+        18 => Some("Q6_K"),
+        _ => None,
+    }
 }
 
 fn safe_component(value: &str) -> Result<&str, ModelError> {
@@ -1060,6 +1340,74 @@ mod tests {
         }
     }
 
+    fn test_gguf(payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::from(&b"GGUF"[..]);
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    #[test]
+    fn gguf_inspection_derives_registered_metadata() {
+        let mut bytes = Vec::from(&b"GGUF"[..]);
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u64.to_le_bytes());
+        bytes.extend_from_slice(&5_u64.to_le_bytes());
+        for (key, value) in [
+            ("general.name", "Inspected model"),
+            ("tokenizer.ggml.model", "llama"),
+            ("tokenizer.chat_template", "{{ messages }}"),
+        ] {
+            push_gguf_string(&mut bytes, key);
+            bytes.extend_from_slice(&8_u32.to_le_bytes());
+            push_gguf_string(&mut bytes, value);
+        }
+        push_gguf_string(&mut bytes, "llama.context_length");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&131_072_u32.to_le_bytes());
+        push_gguf_string(&mut bytes, "general.file_type");
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&15_u32.to_le_bytes());
+
+        let inspected = inspect_gguf_metadata(&bytes, 5);
+        assert_eq!(inspected.name.as_deref(), Some("Inspected model"));
+        assert_eq!(inspected.tokenizer.as_deref(), Some("llama"));
+        assert_eq!(inspected.context_limit, Some(131_072));
+        assert_eq!(inspected.quantization.as_deref(), Some("Q4_K_M"));
+        assert!(inspected.chat_template.is_some());
+    }
+
+    #[tokio::test]
+    async fn verification_rejects_size_mismatch_and_non_gguf_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.gguf");
+        let bytes = test_gguf(b"payload");
+        fs::write(&path, &bytes).await.unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let mut entry = test_entry("http://localhost/model".to_owned(), &bytes, sha256);
+        entry.bytes += 1;
+        assert!(matches!(
+            verify_file(&path, &entry).await,
+            Err(ModelError::Verification(_))
+        ));
+
+        let invalid = b"not a GGUF model file";
+        fs::write(&path, invalid).await.unwrap();
+        entry.bytes = invalid.len() as u64;
+        entry.sha256 = format!("{:x}", Sha256::digest(invalid));
+        assert!(matches!(
+            verify_file(&path, &entry).await,
+            Err(ModelError::Verification(_))
+        ));
+    }
+
     async fn test_manager(directory: &tempfile::TempDir, entry: CatalogEntry) -> ModelManager {
         let store = JobStore::open_path(&directory.path().join("test.sqlite3"))
             .await
@@ -1080,7 +1428,7 @@ mod tests {
 
     #[tokio::test]
     async fn range_resume_verifies_then_atomically_registers() {
-        let bytes = b"GGUF-small-controlled-fixture".to_vec();
+        let bytes = test_gguf(b"small-controlled-fixture");
         let sha256 = format!("{:x}", Sha256::digest(&bytes));
         let saw_range = Arc::new(AtomicBool::new(false));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1108,7 +1456,11 @@ mod tests {
             .unwrap();
         let (job, _) = manager
             .submit_download(DownloadSubmission {
-                catalog_id: "fixture-model".to_owned(),
+                catalog_id: Some("fixture-model".to_owned()),
+                provider: None,
+                repository: None,
+                revision: None,
+                artifact: None,
                 idempotency_key: "range-resume".to_owned(),
                 license_accepted: true,
             })
@@ -1126,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn hash_failure_never_registers_or_finalizes() {
-        let bytes = b"GGUF-corrupt-controlled-fixture".to_vec();
+        let bytes = test_gguf(b"corrupt-controlled-fixture");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(
@@ -1149,7 +1501,11 @@ mod tests {
         .await;
         manager
             .submit_download(DownloadSubmission {
-                catalog_id: "fixture-model".to_owned(),
+                catalog_id: Some("fixture-model".to_owned()),
+                provider: None,
+                repository: None,
+                revision: None,
+                artifact: None,
                 idempotency_key: "hash-failure".to_owned(),
                 license_accepted: true,
             })

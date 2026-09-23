@@ -14,6 +14,9 @@ import {
   localDownload,
   localJobAction,
   localModelAction,
+  localSearch,
+  type ModelCandidate,
+  type ModelSearchResponse,
   type LocalModelSnapshot,
 } from './models';
 
@@ -545,6 +548,9 @@ function ModelSetup({ port, running }: { port: number; running: boolean }) {
   const [models, setModels] = useState<LocalModelSnapshot | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState<ModelSearchResponse | null>(null);
+  const [selected, setSelected] = useState<ModelCandidate | null>(null);
   const refresh = useCallback(async () => {
     if (!running) return;
     try {
@@ -593,11 +599,11 @@ function ModelSetup({ port, running }: { port: number; running: boolean }) {
     <section className="panel model-panel">
       <div className="panel-heading">
         <div>
-          <span className="eyebrow">MODEL SETUP</span>
+          <span className="eyebrow">MODELS</span>
           <h2>
             {models.inventory.ready
               ? 'Server model-ready'
-              : 'Install your first text model'}
+              : 'Download a text model'}
           </h2>
         </div>
         <span className={`readiness ${models.inventory.ready ? 'ready' : ''}`}>
@@ -630,34 +636,131 @@ function ModelSetup({ port, running }: { port: number; running: boolean }) {
           detail={models.hardware.runtime.llama_cpp.reason}
         />
       </div>
-      {!models.inventory.ready && (
-        <div className="profile-list">
-          {models.setup.profiles
-            .filter((profile) => profile.id !== 'manual')
-            .map((profile) => (
+      <div className="catalog-details">
+        <h3>Download a model</h3>
+        <p>
+          Search Hugging Face by friendly name, exact repository, or an alias
+          such as llama3.2:3b. You will confirm one immutable GGUF artifact.
+        </p>
+        <form
+          className="panel-heading"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!query.trim()) return;
+            void action('model-search', async () => {
+              setSelected(null);
+              setResults(await localSearch(port, query));
+            });
+          }}
+        >
+          <input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Llama 3.2 3B or owner/repository"
+            aria-label="Find a model"
+          />
+          <button
+            className="primary-button"
+            disabled={busy !== '' || !query.trim()}
+          >
+            Search
+          </button>
+        </form>
+        {results && (
+          <>
+            <small>Resolved search: {results.normalized_query}</small>
+            {results.candidates.length === 0 ? (
+              <p>No compatible single-file GGUF artifacts were found.</p>
+            ) : (
+              <div className="dashboard-catalog">
+                {results.candidates.map((candidate) => (
+                  <article key={candidate.candidate_id}>
+                    <strong>{candidate.display_name}</strong>
+                    <p>{candidate.repository}</p>
+                    <small>
+                      {candidate.artifact} ·{' '}
+                      {candidate.parameter_size ?? 'Unknown parameters'} ·{' '}
+                      {candidate.quantization ?? 'Unknown quantization'} ·{' '}
+                      {formatBytes(candidate.bytes)}
+                    </small>
+                    <small>
+                      Hugging Face · revision {candidate.revision.slice(0, 12)}…
+                      · SHA-256{' '}
+                      {candidate.sha256
+                        ? `${candidate.sha256.slice(0, 12)}…`
+                        : 'Unknown'}
+                    </small>
+                    <small>
+                      {candidate.license ?? 'Unknown license'} ·{' '}
+                      {candidate.access} · context{' '}
+                      {candidate.context_limit?.toLocaleString() ?? 'Unknown'} ·
+                      tokenizer {candidate.tokenizer ?? 'Unknown'}
+                    </small>
+                    <small>
+                      Chat template{' '}
+                      {candidate.chat_template_available === null
+                        ? 'Unknown'
+                        : candidate.chat_template_available
+                          ? 'available'
+                          : 'not reported'}{' '}
+                      · {candidate.capabilities.join(', ')}
+                    </small>
+                    <small>
+                      Disk {formatBytes(candidate.estimated_disk_bytes)} · RAM{' '}
+                      {formatBytes(candidate.estimated_ram_bytes)} ·{' '}
+                      {candidate.runtime_reason}
+                    </small>
+                    {candidate.unavailable_reason && (
+                      <p>{candidate.unavailable_reason}</p>
+                    )}
+                    <button
+                      className="primary-button"
+                      disabled={!candidate.downloadable || busy !== ''}
+                      onClick={() => setSelected(candidate)}
+                    >
+                      Select exact artifact
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        {selected && (
+          <div className="model-download">
+            <div>
+              <strong>Confirm exact artifact</strong>
+              <small>
+                {selected.repository}@{selected.revision}
+              </small>
+              <small>
+                {selected.artifact} · {formatBytes(selected.bytes)} ·{' '}
+                {selected.license ?? 'Unknown license'}
+              </small>
+            </div>
+            <div>
               <button
-                key={profile.id}
-                className="profile-card"
-                disabled={!profile.compatible || busy !== ''}
-                title={profile.exclusion_reasons.join(' ')}
+                className="quiet-button"
+                onClick={() => setSelected(null)}
+              >
+                Cancel
+              </button>{' '}
+              <button
+                className="primary-button"
+                disabled={busy !== ''}
                 onClick={() =>
-                  void action(profile.id, async () => {
-                    for (const id of profile.entry_ids)
-                      await localDownload(port, id);
+                  void action(selected.candidate_id, async () => {
+                    await localDownload(port, selected);
+                    setSelected(null);
                   })
                 }
               >
-                <strong>{profile.name}</strong>
-                <span>{formatBytes(profile.download_bytes)}</span>
-                <small>
-                  {profile.compatible
-                    ? 'Compatible with detected server'
-                    : profile.exclusion_reasons.join(' ')}
-                </small>
+                Accept license &amp; download
               </button>
-            ))}
-        </div>
-      )}
+            </div>
+          </div>
+        )}
+      </div>
       {active.map((job) => (
         <div className="model-download" key={job.id}>
           <div>
@@ -762,36 +865,6 @@ function ModelSetup({ port, running }: { port: number; running: boolean }) {
           </div>
         ))}
       </div>
-      <details className="catalog-details">
-        <summary>Approved catalog · {models.catalog.catalog_version}</summary>
-        <div className="dashboard-catalog">
-          {models.catalog.entries.map((entry) => {
-            const installed = models.inventory.models.some(
-              (model) => model.catalog_id === entry.id,
-            );
-            return (
-              <article key={entry.id}>
-                <span>{entry.roles.join(' · ')}</span>
-                <strong>{entry.name}</strong>
-                <p>{entry.reason}</p>
-                <small>
-                  {entry.runtime_status.replace('_', ' ')} · {entry.license} ·{' '}
-                  {formatBytes(entry.bytes)}
-                </small>
-                <button
-                  className="primary-button"
-                  disabled={installed || busy !== ''}
-                  onClick={() =>
-                    void action(entry.id, () => localDownload(port, entry.id))
-                  }
-                >
-                  {installed ? 'Installed' : 'Accept license & download'}
-                </button>
-              </article>
-            );
-          })}
-        </div>
-      </details>
     </section>
   );
 }

@@ -112,6 +112,9 @@ impl From<ModelError> for ApiError {
             ),
             ModelError::RuntimeUnavailable(_) => (StatusCode::CONFLICT, "runtime_unavailable"),
             ModelError::Runtime(_) => (StatusCode::BAD_GATEWAY, "runtime_failed"),
+            ModelError::Http(_) | ModelError::Provider(_) => {
+                (StatusCode::BAD_GATEWAY, "model_provider_failed")
+            }
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         let message = if status == StatusCode::INTERNAL_SERVER_ERROR {
@@ -229,6 +232,11 @@ struct EventsQuery {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModelSearchQuery {
+    q: String,
+}
+
 #[derive(Debug, Serialize)]
 struct EventsResponse {
     events: Vec<JobEvent>,
@@ -275,6 +283,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/hardware/refresh", post(refresh_hardware))
         .route("/api/v1/model-catalog", get(model_catalog))
         .route("/api/v1/model-setup", get(model_setup))
+        .route("/api/v1/model-search", get(model_search))
         .route("/api/v1/model-downloads", post(create_model_download))
         .route("/api/v1/models", get(installed_models))
         .route("/api/v1/models/export", get(export_inventory))
@@ -415,6 +424,14 @@ async fn model_catalog(State(state): State<Arc<AppState>>) -> impl IntoResponse 
 
 async fn model_setup(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(state.models.setup_plan().await?))
+}
+
+async fn model_search(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<ModelSearchQuery>, QueryRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let Query(query) = query.map_err(|error| query_rejection(&error))?;
+    Ok(Json(state.models.search_models(&query.q).await?))
 }
 
 async fn create_model_download(
