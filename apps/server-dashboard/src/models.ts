@@ -7,18 +7,6 @@ export interface LocalModelSnapshot {
     model_storage: { root: string; free_bytes: number | null };
     runtime: { llama_cpp: { available: boolean; reason: string } };
   };
-  catalog: {
-    catalog_version: string;
-    entries: Array<{
-      id: string;
-      name: string;
-      roles: string[];
-      bytes: number;
-      license: string;
-      runtime_status: string;
-      reason: string;
-    }>;
-  };
   inventory: {
     ready: boolean;
     default_model_id: string | null;
@@ -34,16 +22,6 @@ export interface LocalModelSnapshot {
       compatibility_reason: string;
     }>;
   };
-  setup: {
-    profiles: Array<{
-      id: string;
-      name: string;
-      entry_ids: string[];
-      compatible: boolean;
-      exclusion_reasons: string[];
-      download_bytes: number;
-    }>;
-  };
   jobs: Array<{
     id: string;
     job_type: string;
@@ -51,6 +29,37 @@ export interface LocalModelSnapshot {
     progress: number;
     input: { catalog_id?: string };
   }>;
+}
+
+export interface ModelCandidate {
+  candidate_id: string;
+  provider: string;
+  repository: string;
+  revision: string;
+  artifact: string;
+  display_name: string;
+  parameter_size: string | null;
+  quantization: string | null;
+  format: string;
+  bytes: number | null;
+  sha256: string | null;
+  license: string | null;
+  access: string;
+  context_limit: number | null;
+  tokenizer: string | null;
+  chat_template_available: boolean | null;
+  capabilities: string[];
+  runtime_compatible: boolean;
+  runtime_reason: string;
+  estimated_disk_bytes: number | null;
+  estimated_ram_bytes: number | null;
+  downloadable: boolean;
+  unavailable_reason: string | null;
+}
+
+export interface ModelSearchResponse {
+  normalized_query: string;
+  candidates: ModelCandidate[];
 }
 
 async function api<T>(
@@ -80,28 +89,33 @@ async function api<T>(
 export async function loadLocalModels(
   port: number,
 ): Promise<LocalModelSnapshot> {
-  const [hardware, catalog, inventory, setup, jobs] = await Promise.all([
+  const [hardware, inventory, jobs] = await Promise.all([
     api<LocalModelSnapshot['hardware']>(port, '/api/v1/hardware'),
-    api<LocalModelSnapshot['catalog']>(port, '/api/v1/model-catalog'),
     api<LocalModelSnapshot['inventory']>(port, '/api/v1/models'),
-    api<LocalModelSnapshot['setup']>(port, '/api/v1/model-setup'),
     api<{ jobs: LocalModelSnapshot['jobs'] }>(port, '/api/v1/jobs?limit=100'),
   ]);
   return {
     hardware,
-    catalog,
     inventory,
-    setup,
     jobs: jobs.jobs.filter((job) => job.job_type === 'model_download'),
   };
 }
 
-export const localDownload = (port: number, catalogId: string) =>
+export const localSearch = (port: number, query: string) =>
+  api<ModelSearchResponse>(
+    port,
+    `/api/v1/model-search?q=${encodeURIComponent(query)}`,
+  );
+
+export const localDownload = (port: number, candidate: ModelCandidate) =>
   api(port, '/api/v1/model-downloads', {
     method: 'POST',
     body: JSON.stringify({
-      catalog_id: catalogId,
-      idempotency_key: `dashboard-${catalogId}-${crypto.randomUUID()}`,
+      provider: candidate.provider,
+      repository: candidate.repository,
+      revision: candidate.revision,
+      artifact: candidate.artifact,
+      idempotency_key: `dashboard-${candidate.candidate_id}-${crypto.randomUUID()}`,
       license_accepted: true,
     }),
   });

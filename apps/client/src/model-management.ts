@@ -34,30 +34,37 @@ export interface HardwareCapabilities {
   };
 }
 
-export interface CatalogEntry {
-  id: string;
-  name: string;
-  roles: string[];
+export interface ModelCandidate {
+  candidate_id: string;
+  provider: string;
   repository: string;
   revision: string;
   artifact: string;
+  display_name: string;
+  parameter_size: string | null;
   format: string;
-  quantization: string;
-  bytes: number;
-  sha256: string;
-  license: string;
-  license_url: string;
+  quantization: string | null;
+  bytes: number | null;
+  sha256: string | null;
+  license: string | null;
   access: string;
-  runtime_status: 'executable' | 'catalog_only';
+  context_limit: number | null;
+  tokenizer: string | null;
+  chat_template_available: boolean | null;
   capabilities: string[];
-  estimated_ram_bytes: number;
-  estimated_vram_bytes: number | null;
-  reason: string;
+  runtime_compatible: boolean;
+  runtime_reason: string;
+  estimated_disk_bytes: number | null;
+  estimated_ram_bytes: number | null;
+  downloadable: boolean;
+  unavailable_reason: string | null;
 }
 
-export interface ModelCatalog {
-  catalog_version: string;
-  entries: CatalogEntry[];
+export interface ModelSearchResponse {
+  provider: string;
+  query: string;
+  normalized_query: string;
+  candidates: ModelCandidate[];
 }
 
 export interface InstalledModel {
@@ -92,32 +99,13 @@ export interface ModelJob {
   error?: { code?: string; message?: string };
 }
 
-export interface ProfileAssessment {
-  id: string;
-  name: string;
-  entry_ids: string[];
-  compatible: boolean;
-  exclusion_reasons: string[];
-  download_bytes: number;
-  required_disk_bytes: number;
-  estimated_ram_bytes: number;
-  estimated_vram_bytes: number | null;
-}
-
-export interface SetupPlan {
-  ready: boolean;
-  profiles: ProfileAssessment[];
-}
-
 interface JobsResponse {
   jobs: ModelJob[];
 }
 
 export interface ModelSnapshot {
   hardware: HardwareCapabilities;
-  catalog: ModelCatalog;
   inventory: Inventory;
-  setup: SetupPlan;
   jobs: ModelJob[];
 }
 
@@ -157,28 +145,37 @@ async function request<T>(
 export async function loadModelSnapshot(
   profile: ConnectionProfile,
 ): Promise<ModelSnapshot> {
-  const [hardware, catalog, inventory, setup, jobs] = await Promise.all([
+  const [hardware, inventory, jobs] = await Promise.all([
     request<HardwareCapabilities>(profile, '/api/v1/hardware'),
-    request<ModelCatalog>(profile, '/api/v1/model-catalog'),
     request<Inventory>(profile, '/api/v1/models'),
-    request<SetupPlan>(profile, '/api/v1/model-setup'),
     request<JobsResponse>(profile, '/api/v1/jobs?limit=100'),
   ]);
   return {
     hardware,
-    catalog,
     inventory,
-    setup,
     jobs: jobs.jobs.filter((job) => job.job_type === 'model_download'),
   };
 }
 
-export function startDownload(profile: ConnectionProfile, catalogId: string) {
+export function searchModels(profile: ConnectionProfile, query: string) {
+  return request<ModelSearchResponse>(
+    profile,
+    `/api/v1/model-search?q=${encodeURIComponent(query)}`,
+  );
+}
+
+export function startDownload(
+  profile: ConnectionProfile,
+  candidate: ModelCandidate,
+) {
   return request(profile, '/api/v1/model-downloads', {
     method: 'POST',
     body: JSON.stringify({
-      catalog_id: catalogId,
-      idempotency_key: `client-${catalogId}-${crypto.randomUUID()}`,
+      provider: candidate.provider,
+      repository: candidate.repository,
+      revision: candidate.revision,
+      artifact: candidate.artifact,
+      idempotency_key: `client-${candidate.candidate_id}-${crypto.randomUUID()}`,
       license_accepted: true,
     }),
   });

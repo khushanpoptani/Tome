@@ -2,7 +2,6 @@ import {
   Component,
   useCallback,
   useEffect,
-  useMemo,
   useState,
   type ChangeEvent,
   type ErrorInfo,
@@ -41,8 +40,11 @@ import {
   loadModelSnapshot,
   modelAction,
   retryJob,
+  searchModels,
   setDefaultModel,
   startDownload,
+  type ModelCandidate,
+  type ModelSearchResponse,
   type ModelSnapshot,
 } from './model-management';
 
@@ -1288,6 +1290,8 @@ function ModelManagement({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState('');
   const [search, setSearch] = useState('');
+  const [results, setResults] = useState<ModelSearchResponse | null>(null);
+  const [selected, setSelected] = useState<ModelCandidate | null>(null);
   const [live, setLive] = useState<'connecting' | 'live' | 'offline'>(
     'connecting',
   );
@@ -1370,22 +1374,6 @@ function ModelManagement({
     }
   };
 
-  const entries = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    if (!snapshot || !needle) return snapshot?.catalog.entries ?? [];
-    return snapshot.catalog.entries.filter((entry) =>
-      [
-        entry.name,
-        entry.repository,
-        entry.roles.join(' '),
-        entry.capabilities.join(' '),
-      ]
-        .join(' ')
-        .toLowerCase()
-        .includes(needle),
-    );
-  }, [search, snapshot]);
-
   if (!snapshot)
     return (
       <section className="model-workspace loading-panel">
@@ -1405,7 +1393,7 @@ function ModelManagement({
           <p>
             {snapshot.inventory.ready
               ? 'The server has a verified compatible text model.'
-              : 'First-run setup needs a verified compatible text model.'}
+              : 'Download and verify a compatible GGUF model to enable inference.'}
           </p>
         </div>
         <div className="workspace-actions">
@@ -1451,33 +1439,174 @@ function ModelManagement({
         />
       </div>
 
-      {!snapshot.inventory.ready && (
-        <div className="setup-strip">
+      <section className="model-section">
+        <div className="catalog-heading">
           <div>
-            <strong>Finish first-run model setup</strong>
-            <p>Only profiles compatible with this server can be started.</p>
+            <h3>Download a model</h3>
+            <small>
+              Search by a friendly name, Hugging Face repository, or alias such
+              as llama3.2:3b.
+            </small>
           </div>
-          <div className="profile-buttons">
-            {snapshot.setup.profiles
-              .filter((candidate) => candidate.id !== 'manual')
-              .map((candidate) => (
-                <button
-                  key={candidate.id}
-                  disabled={!candidate.compatible || busy !== ''}
-                  title={candidate.exclusion_reasons.join(' ')}
-                  onClick={() =>
-                    void run(`profile-${candidate.id}`, async () => {
-                      for (const id of candidate.entry_ids)
-                        await startDownload(profile, id);
-                    })
-                  }
-                >
-                  {candidate.name} · {formatBytes(candidate.download_bytes)}
-                </button>
-              ))}
-          </div>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (!search.trim()) return;
+              void run('model-search', async () => {
+                setSelected(null);
+                setResults(await searchModels(profile, search));
+              });
+            }}
+          >
+            <input
+              value={search}
+              onChange={(event) => setSearch(event.target.value)}
+              placeholder="Llama 3.2 3B or owner/repository"
+              aria-label="Find a model"
+            />
+            <button disabled={busy !== '' || !search.trim()}>Search</button>
+          </form>
         </div>
-      )}
+        {results && (
+          <>
+            <p className="provider-note">
+              Provider: Hugging Face · resolved search:{' '}
+              {results.normalized_query}
+            </p>
+            {results.candidates.length === 0 ? (
+              <p className="empty-message">
+                No compatible single-file GGUF artifacts were found.
+              </p>
+            ) : (
+              <div className="catalog-grid">
+                {results.candidates.map((candidate) => (
+                  <article
+                    className="catalog-card"
+                    key={candidate.candidate_id}
+                  >
+                    <h4>{candidate.display_name}</h4>
+                    <p>{candidate.repository}</p>
+                    <dl>
+                      <div>
+                        <dt>Artifact</dt>
+                        <dd>{candidate.artifact}</dd>
+                      </div>
+                      <div>
+                        <dt>Revision</dt>
+                        <dd>{candidate.revision.slice(0, 12)}…</dd>
+                      </div>
+                      <div>
+                        <dt>Provider / SHA-256</dt>
+                        <dd>
+                          Hugging Face ·{' '}
+                          {candidate.sha256
+                            ? `${candidate.sha256.slice(0, 12)}…`
+                            : 'Unknown'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Model</dt>
+                        <dd>
+                          {candidate.parameter_size ?? 'Unknown'} ·{' '}
+                          {candidate.quantization ?? 'Unknown quantization'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Format / size</dt>
+                        <dd>
+                          {candidate.format} · {formatBytes(candidate.bytes)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>License / access</dt>
+                        <dd>
+                          {candidate.license ?? 'Unknown'} · {candidate.access}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Context / tokenizer</dt>
+                        <dd>
+                          {candidate.context_limit?.toLocaleString() ??
+                            'Unknown'}{' '}
+                          · {candidate.tokenizer ?? 'Unknown'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Chat template</dt>
+                        <dd>
+                          {candidate.chat_template_available === null
+                            ? 'Unknown'
+                            : candidate.chat_template_available
+                              ? 'Available'
+                              : 'Not reported'}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Capabilities</dt>
+                        <dd>{candidate.capabilities.join(', ')}</dd>
+                      </div>
+                      <div>
+                        <dt>Disk / RAM estimate</dt>
+                        <dd>
+                          {formatBytes(candidate.estimated_disk_bytes)} /{' '}
+                          {formatBytes(candidate.estimated_ram_bytes)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Runtime</dt>
+                        <dd>{candidate.runtime_reason}</dd>
+                      </div>
+                    </dl>
+                    {candidate.unavailable_reason && (
+                      <p>{candidate.unavailable_reason}</p>
+                    )}
+                    <button
+                      disabled={!candidate.downloadable || busy !== ''}
+                      onClick={() => setSelected(candidate)}
+                    >
+                      Select exact artifact
+                    </button>
+                  </article>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+        {selected && (
+          <div
+            className="setup-strip"
+            role="dialog"
+            aria-label="Confirm model download"
+          >
+            <div>
+              <strong>Confirm exact artifact</strong>
+              <p>
+                {selected.repository}@{selected.revision}
+              </p>
+              <p>
+                {selected.artifact} · {formatBytes(selected.bytes)} ·{' '}
+                {selected.license ?? 'Unknown license'}
+              </p>
+            </div>
+            <div className="row-actions">
+              <button className="secondary" onClick={() => setSelected(null)}>
+                Cancel
+              </button>
+              <button
+                disabled={busy !== ''}
+                onClick={() =>
+                  void run(selected.candidate_id, async () => {
+                    await startDownload(profile, selected);
+                    setSelected(null);
+                  })
+                }
+              >
+                Accept license &amp; download
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
 
       {activeJobs.length > 0 && (
         <section className="model-section">
@@ -1605,66 +1734,6 @@ function ModelManagement({
             </article>
           ))
         )}
-      </section>
-
-      <section className="model-section">
-        <div className="catalog-heading">
-          <div>
-            <h3>Approved catalog</h3>
-            <small>Version {snapshot.catalog.catalog_version}</small>
-          </div>
-          <input
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search models or capabilities"
-          />
-        </div>
-        <div className="catalog-grid">
-          {entries.map((entry) => {
-            const installed = snapshot.inventory.models.some(
-              (model) => model.catalog_id === entry.id,
-            );
-            return (
-              <article className="catalog-card" key={entry.id}>
-                <div className="tag-row">
-                  {entry.roles.map((role) => (
-                    <span key={role}>{role.replaceAll('_', ' ')}</span>
-                  ))}
-                </div>
-                <h4>{entry.name}</h4>
-                <p>{entry.reason}</p>
-                <dl>
-                  <div>
-                    <dt>Artifact</dt>
-                    <dd>
-                      {entry.format} · {entry.quantization}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Download</dt>
-                    <dd>{formatBytes(entry.bytes)}</dd>
-                  </div>
-                  <div>
-                    <dt>License</dt>
-                    <dd>{entry.license}</dd>
-                  </div>
-                  <div>
-                    <dt>Runtime</dt>
-                    <dd>{entry.runtime_status.replace('_', ' ')}</dd>
-                  </div>
-                </dl>
-                <button
-                  disabled={installed || busy !== ''}
-                  onClick={() =>
-                    void run(entry.id, () => startDownload(profile, entry.id))
-                  }
-                >
-                  {installed ? 'Installed' : 'Accept license & download'}
-                </button>
-              </article>
-            );
-          })}
-        </div>
       </section>
     </section>
   );

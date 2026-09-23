@@ -277,6 +277,7 @@ async fn model_management_api_exposes_hardware_catalog_setup_and_inventory() {
     }
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -298,6 +299,17 @@ async fn model_management_api_exposes_hardware_catalog_setup_and_inventory() {
     let body: Value =
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "invalid_model_request");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/model-search?q=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
