@@ -53,6 +53,7 @@ The API base is `/api/v1`; protocol version `1` is independent of the server pac
 | `GET /api/v1/jobs/{id}`         | Retrieve a job                                             |
 | `POST /api/v1/jobs/{id}/cancel` | Cancel a queued or running job                             |
 | `POST /api/v1/jobs/{id}/retry`  | Create a linked retry of a terminal job                    |
+| `POST /api/v1/jobs/clear`       | Clear deletable terminal job and event-log records         |
 | `POST /api/v1/jobs/cleanup`     | Remove terminal jobs finished before an RFC 3339 timestamp |
 | `GET /api/v1/events`            | Replay events after `after_event_id`                       |
 | `GET /api/v1/events/ws`         | WebSocket replay/live stream after `after_event_id`        |
@@ -99,6 +100,23 @@ Terminal jobs are preserved across restarts. Queued jobs remain queued and can b
 
 Every state write and its event commit in one SQLite transaction. Events have monotonic integer IDs and are retained with the job until explicit or configured cleanup. Progress is in the inclusive range 0–1. Retention cleanup removes terminal jobs and their events; it never removes queued/running jobs.
 
+`POST /api/v1/jobs/clear` transactionally removes completed, failed, cancelled, and interrupted job records together with their associated events. It never deletes or changes queued/running jobs. A terminal parent or retry source still referenced by an active job is retained until that active linkage no longer exists, so clearing cannot null or otherwise mutate an active job. Repeating the operation after everything eligible is removed is safe and returns zero removals.
+
+The response distinguishes deleted history from retained work:
+
+```json
+{
+  "removed_terminal_jobs": 12,
+  "removed_job_events": 48,
+  "retained_active_jobs": 2,
+  "retained_active_job_events": 7,
+  "retained_linked_terminal_jobs": 1,
+  "retained_linked_terminal_events": 4
+}
+```
+
+Clearing job logs does not delete installed model records or files, partial-download files or metadata, client-local chats/history, attachments, exports, settings, or unassociated server warnings. Model-download metadata is detached from a deleted terminal job and preserved. The client Jobs screen requires an explicit confirmation describing this boundary, refreshes from the server after success, and reports failures without hiding retained jobs.
+
 The server registers `inference`, `model_download`, `model_verification`, `model_load`, `model_unload`, `attachment_processing`, `ocr`, and `transcription`. Phase 2 implements model download/verification and the load/unload service boundary while preserving this job/event foundation; later job types still fail explicitly as unimplemented. See [Phase 2 model management](phase-2-model-management.md).
 
 At startup the server only discovers files prefixed `tome-job-` in its temporary directory. It emits `server.warning` and leaves them untouched. Ownership validation and deletion belong to the attachment phase.
@@ -119,4 +137,4 @@ This is deliberately not the future client persistence layer. Phase 1 stores no 
 
 ## Validation
 
-Server tests cover configuration safety, simultaneous listeners, clean stop/restart, migrations, idempotency conflicts, cancellation, state/event transactions, restart recovery, progress preservation, HTTP capability/error behavior, and WebSocket replay plus live delivery. Dashboard tests cover address grouping, Tailscale setup states, Ollama state classification, and the fixed loopback endpoint. Client tests cover profile storage/validation, address construction, state transitions, retries, capability retrieval, and protocol mismatch reporting. Run the repository-prescribed suite with `pnpm check`; use `pnpm build:server-dashboard:web` for local dashboard validation and `pnpm build:server:windows` on Windows for the NSIS installer.
+Server tests cover configuration safety, simultaneous listeners, clean stop/restart, migrations, idempotency conflicts, cancellation, state/event transactions, restart recovery, progress preservation, safe terminal-log clearing, active-job/link retention, model-download detachment, HTTP capability/error behavior, and WebSocket replay plus live delivery. Dashboard tests cover address grouping, Tailscale setup states, Ollama state classification, and the fixed loopback endpoint. Client tests cover profile storage/validation, address construction, state transitions, retries, job-log clear success/failure messaging, capability retrieval, and protocol mismatch reporting. Run the repository-prescribed suite with `pnpm check`; use `pnpm build:server-dashboard:web` for local dashboard validation and `pnpm build:server:windows` on Windows for the NSIS installer.

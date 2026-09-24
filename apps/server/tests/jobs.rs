@@ -6,6 +6,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use sqlx::{Row, sqlite::SqlitePoolOptions};
 use tempfile::TempDir;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tome_server::{
@@ -45,9 +46,107 @@ fn download_request(key: &str) -> CreateJob {
 async fn migrations_create_a_usable_database() {
     let directory = TempDir::new().unwrap();
     let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let empty = store.clear_terminal_job_logs().await.unwrap();
+    assert_eq!(empty.removed_terminal_jobs, 0);
+    assert_eq!(empty.removed_job_events, 0);
+    assert_eq!(empty.retained_active_jobs, 0);
     let (job, created) = store.create_job(request("migration-test")).await.unwrap();
     assert!(created);
     assert_eq!(job.state, JobState::Queued);
+}
+
+#[tokio::test]
+async fn migration_three_preserves_existing_download_metadata() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("upgrade.sqlite3");
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TABLE tome_migrations (
+            version INTEGER PRIMARY KEY NOT NULL,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0001_jobs.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../migrations/0002_models.sql"))
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tome_migrations (version, name, applied_at) VALUES
+         (1, 'jobs', '2026-01-01T00:00:00Z'),
+         (2, 'models', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO jobs
+         (id, idempotency_key, job_type, state, input_json, created_at, updated_at, finished_at)
+         VALUES ('download-job', 'upgrade-download', 'model_download', 'interrupted', '{}',
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO model_downloads
+         (job_id, catalog_id, part_path, final_path, bytes_downloaded, expected_bytes,
+          created_at, updated_at)
+         VALUES ('download-job', 'fixture', 'partial.part', 'model.gguf', 25, 100,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = store_at(&database_path).await;
+    assert_eq!(
+        store.get_job("download-job").await.unwrap().state,
+        JobState::Interrupted
+    );
+    drop(store);
+    let reopened = SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    let row =
+        sqlx::query("SELECT job_id, catalog_id, part_path, bytes_downloaded FROM model_downloads")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(row.try_get::<String, _>("job_id").unwrap(), "download-job");
+    assert_eq!(row.try_get::<String, _>("catalog_id").unwrap(), "fixture");
+    assert_eq!(
+        row.try_get::<String, _>("part_path").unwrap(),
+        "partial.part"
+    );
+    assert_eq!(row.try_get::<i64, _>("bytes_downloaded").unwrap(), 25);
+    let migration_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tome_migrations WHERE version = 3")
+            .fetch_one(&reopened)
+            .await
+            .unwrap();
+    assert_eq!(migration_count, 1);
 }
 
 #[tokio::test]
@@ -172,6 +271,207 @@ async fn terminal_jobs_survive_reopen_and_event_replay_uses_cursor() {
     let replay = reopened.events_after(cursor, 100).await.unwrap();
     assert!(replay.iter().all(|event| event.event_id > cursor));
     assert_eq!(replay.last().unwrap().event_type, EventType::JobCompleted);
+}
+
+#[tokio::test]
+async fn clear_job_logs_removes_terminal_history_and_retains_active_jobs() {
+    let directory = TempDir::new().unwrap();
+    let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let (terminal, _) = store.create_job(request("clear-terminal")).await.unwrap();
+    assert_eq!(
+        store.claim_next_queued().await.unwrap().unwrap().id,
+        terminal.id
+    );
+    store
+        .complete_job(&terminal.id, json!({ "ok": true }))
+        .await
+        .unwrap();
+    let (interrupted, _) = store
+        .create_job(download_request("clear-interrupted"))
+        .await
+        .unwrap();
+    store.pause_job(&interrupted.id).await.unwrap();
+    let (running, _) = store.create_job(request("clear-running")).await.unwrap();
+    assert_eq!(
+        store.claim_next_queued().await.unwrap().unwrap().id,
+        running.id
+    );
+    let (queued, _) = store.create_job(request("clear-queued")).await.unwrap();
+
+    let cleared = store.clear_terminal_job_logs().await.unwrap();
+
+    assert_eq!(cleared.removed_terminal_jobs, 2);
+    assert_eq!(cleared.removed_job_events, 7);
+    assert_eq!(cleared.retained_active_jobs, 2);
+    assert_eq!(cleared.retained_active_job_events, 5);
+    assert_eq!(cleared.retained_linked_terminal_jobs, 0);
+    assert!(matches!(
+        store.get_job(&terminal.id).await,
+        Err(StoreError::NotFound)
+    ));
+    assert_eq!(
+        store.get_job(&running.id).await.unwrap().state,
+        JobState::Running
+    );
+    assert_eq!(
+        store.get_job(&queued.id).await.unwrap().state,
+        JobState::Queued
+    );
+    assert!(
+        store
+            .events_after(0, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(
+                event.job_id.as_deref(),
+                Some(id) if id == terminal.id || id == interrupted.id
+            ))
+    );
+
+    let repeated = store.clear_terminal_job_logs().await.unwrap();
+    assert_eq!(repeated.removed_terminal_jobs, 0);
+    assert_eq!(repeated.removed_job_events, 0);
+    assert_eq!(repeated.retained_active_jobs, 2);
+}
+
+#[tokio::test]
+async fn clear_job_logs_preserves_terminal_links_required_by_active_jobs() {
+    let directory = TempDir::new().unwrap();
+    let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let (parent, _) = store.create_job(request("linked-parent")).await.unwrap();
+    store.claim_next_queued().await.unwrap();
+    store
+        .complete_job(&parent.id, json!({ "ok": true }))
+        .await
+        .unwrap();
+    let (child, _) = store
+        .create_job(CreateJob {
+            idempotency_key: "linked-child".to_owned(),
+            job_type: JobType::Inference,
+            input: json!({}),
+            parent_job_id: Some(parent.id.clone()),
+            retry_of_job_id: Some(parent.id.clone()),
+        })
+        .await
+        .unwrap();
+
+    let cleared = store.clear_terminal_job_logs().await.unwrap();
+
+    assert_eq!(cleared.removed_terminal_jobs, 0);
+    assert_eq!(cleared.retained_active_jobs, 1);
+    assert_eq!(cleared.retained_linked_terminal_jobs, 1);
+    assert_eq!(
+        store.get_job(&parent.id).await.unwrap().state,
+        JobState::Completed
+    );
+    let retained_child = store.get_job(&child.id).await.unwrap();
+    assert_eq!(retained_child.state, JobState::Queued);
+    assert_eq!(
+        retained_child.parent_job_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+    assert_eq!(
+        retained_child.retry_of_job_id.as_deref(),
+        Some(parent.id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn clear_job_logs_detaches_download_metadata_and_preserves_partial_file() {
+    let directory = TempDir::new().unwrap();
+    let database_path = directory.path().join("jobs.sqlite3");
+    let partial_path = directory.path().join("model-download.part");
+    std::fs::write(&partial_path, b"partial model bytes").unwrap();
+    let store = store_at(&database_path).await;
+    let (download, _) = store
+        .create_job(download_request("clear-download"))
+        .await
+        .unwrap();
+    store.claim_next_queued().await.unwrap();
+    let pool = SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO model_downloads
+         (job_id, catalog_id, part_path, final_path, bytes_downloaded, expected_bytes,
+          created_at, updated_at)
+         VALUES (?, 'fixture', ?, ?, 19, 100, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .bind(&download.id)
+    .bind(partial_path.display().to_string())
+    .bind(directory.path().join("model.gguf").display().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    store
+        .fail_job(&download.id, json!({ "message": "network stopped" }))
+        .await
+        .unwrap();
+
+    let cleared = store.clear_terminal_job_logs().await.unwrap();
+
+    assert_eq!(cleared.removed_terminal_jobs, 1);
+    let row = sqlx::query("SELECT job_id, part_path, bytes_downloaded FROM model_downloads")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(row.try_get::<Option<String>, _>("job_id").unwrap(), None);
+    assert_eq!(
+        row.try_get::<String, _>("part_path").unwrap(),
+        partial_path.display().to_string()
+    );
+    assert_eq!(row.try_get::<i64, _>("bytes_downloaded").unwrap(), 19);
+    assert_eq!(
+        std::fs::read(&partial_path).unwrap(),
+        b"partial model bytes"
+    );
+}
+
+#[tokio::test]
+async fn clear_job_logs_api_returns_removed_and_retained_counts() {
+    let directory = TempDir::new().unwrap();
+    let store = store_at(&directory.path().join("jobs.sqlite3")).await;
+    let (terminal, _) = store
+        .create_job(request("api-clear-terminal"))
+        .await
+        .unwrap();
+    store.claim_next_queued().await.unwrap();
+    store.cancel_job(&terminal.id).await.unwrap();
+    store.create_job(request("api-clear-queued")).await.unwrap();
+    let models = ModelManager::open(store.clone(), directory.path())
+        .await
+        .unwrap();
+    let app = router(AppState {
+        store,
+        network_mode: NetworkMode::Loopback,
+        models,
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/jobs/clear")
+                .header("X-Tome-Protocol-Version", "1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["removed_terminal_jobs"], 1);
+    assert_eq!(body["removed_job_events"], 4);
+    assert_eq!(body["retained_active_jobs"], 1);
+    assert_eq!(body["retained_active_job_events"], 2);
 }
 
 #[tokio::test]

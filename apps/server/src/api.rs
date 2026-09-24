@@ -23,7 +23,7 @@ use crate::{
     config::NetworkMode,
     model::{API_VERSION, Job, JobEvent, JobState, JobType, PROTOCOL_VERSION},
     models::{DownloadSubmission, ModelError, ModelManager},
-    store::{CreateJob, JobStore, StoreError},
+    store::{ClearJobLogsResult, CreateJob, JobStore, StoreError},
 };
 
 #[derive(Clone)]
@@ -263,6 +263,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/version", get(version))
         .route("/api/v1/capabilities", get(capabilities))
         .route("/api/v1/jobs", post(create_job).get(list_jobs))
+        .route("/api/v1/jobs/clear", post(clear_job_logs))
         .route("/api/v1/jobs/cleanup", post(cleanup_jobs))
         .route("/api/v1/jobs/{id}", get(get_job))
         .route("/api/v1/jobs/{id}/cancel", post(cancel_job))
@@ -567,6 +568,12 @@ async fn cleanup_jobs(
     Ok(Json(CleanupResponse {
         removed_jobs: state.store.cleanup_terminal_before(&payload.before).await?,
     }))
+}
+
+async fn clear_job_logs(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ClearJobLogsResult>, ApiError> {
+    Ok(Json(state.store.clear_terminal_job_logs().await?))
 }
 
 async fn events_socket(

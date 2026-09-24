@@ -96,7 +96,7 @@ Settings previews category counts and sizes. Deletion requires the exact phrase 
 
 ## Job replay
 
-The jobs screen fetches `/api/v1/jobs`, opens `/api/v1/events/ws?after_event_id=<cursor>`, advances the native per-profile cursor monotonically, refreshes after events, reconnects after interruption, and polls as a fallback. It displays type, state, progress, timestamps, parent/retry linkage, and server errors. Only existing cancel and retry operations are exposed.
+The jobs screen fetches `/api/v1/jobs`, opens `/api/v1/events/ws?after_event_id=<cursor>`, advances the native per-profile cursor monotonically, refreshes after events, reconnects after interruption, and polls as a fallback. It displays type, state, progress, timestamps, parent/retry linkage, and server errors. Cancel and retry operations are exposed alongside **Clear job logs**, which requires an explicit scope confirmation, removes only eligible terminal server jobs and their associated events, refreshes authoritative state after success, and reports retained active/linked records. It does not invoke the separate client-local data deletion workflow or remove models, partial downloads, chats, attachments, exports, or settings.
 
 ## Backups and troubleshooting
 

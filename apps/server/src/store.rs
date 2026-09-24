@@ -1,5 +1,6 @@
 use std::{path::Path, str::FromStr, time::Duration};
 
+use serde::Serialize;
 use serde_json::{Value, json};
 use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
@@ -33,6 +34,16 @@ pub struct CreateJob {
     pub input: Value,
     pub parent_job_id: Option<String>,
     pub retry_of_job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct ClearJobLogsResult {
+    pub removed_terminal_jobs: u64,
+    pub removed_job_events: u64,
+    pub retained_active_jobs: u64,
+    pub retained_active_job_events: u64,
+    pub retained_linked_terminal_jobs: u64,
+    pub retained_linked_terminal_events: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -513,8 +524,14 @@ impl JobStore {
     pub async fn cleanup_terminal_before(&self, before: &str) -> Result<u64, StoreError> {
         let mut transaction = self.pool.begin().await?;
         let ids = sqlx::query(
-            "SELECT id FROM jobs WHERE state IN ('completed', 'failed', 'cancelled', 'interrupted')
-             AND finished_at < ?",
+            "SELECT terminal.id FROM jobs AS terminal
+             WHERE terminal.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+             AND terminal.finished_at < ?
+             AND NOT EXISTS (
+                 SELECT 1 FROM jobs AS active
+                 WHERE active.state IN ('queued', 'running')
+                 AND (active.parent_job_id = terminal.id OR active.retry_of_job_id = terminal.id)
+             )",
         )
         .bind(before)
         .fetch_all(&mut *transaction)
@@ -532,6 +549,84 @@ impl JobStore {
         }
         transaction.commit().await?;
         Ok(ids.len() as u64)
+    }
+
+    pub async fn clear_terminal_job_logs(&self) -> Result<ClearJobLogsResult, StoreError> {
+        let mut transaction = self.pool.begin().await?;
+        let removed_job_events = sqlx::query(
+            "DELETE FROM job_events WHERE job_id IN (
+                 SELECT terminal.id FROM jobs AS terminal
+                 WHERE terminal.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+                 AND NOT EXISTS (
+                     SELECT 1 FROM jobs AS active
+                     WHERE active.state IN ('queued', 'running')
+                     AND (active.parent_job_id = terminal.id OR active.retry_of_job_id = terminal.id)
+                 )
+             )",
+        )
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let removed_terminal_jobs = sqlx::query(
+            "DELETE FROM jobs AS terminal
+             WHERE terminal.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+             AND NOT EXISTS (
+                 SELECT 1 FROM jobs AS active
+                 WHERE active.state IN ('queued', 'running')
+                 AND (active.parent_job_id = terminal.id OR active.retry_of_job_id = terminal.id)
+             )",
+        )
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected();
+        let retained_active_jobs = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs WHERE state IN ('queued', 'running')",
+        )
+        .fetch_one(&mut *transaction)
+        .await?
+        .cast_unsigned();
+        let retained_active_job_events = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_events AS event
+             JOIN jobs AS job ON job.id = event.job_id
+             WHERE job.state IN ('queued', 'running')",
+        )
+        .fetch_one(&mut *transaction)
+        .await?
+        .cast_unsigned();
+        let retained_linked_terminal_jobs = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM jobs AS terminal
+             WHERE terminal.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+             AND EXISTS (
+                 SELECT 1 FROM jobs AS active
+                 WHERE active.state IN ('queued', 'running')
+                 AND (active.parent_job_id = terminal.id OR active.retry_of_job_id = terminal.id)
+             )",
+        )
+        .fetch_one(&mut *transaction)
+        .await?
+        .cast_unsigned();
+        let retained_linked_terminal_events = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM job_events AS event
+             JOIN jobs AS terminal ON terminal.id = event.job_id
+             WHERE terminal.state IN ('completed', 'failed', 'cancelled', 'interrupted')
+             AND EXISTS (
+                 SELECT 1 FROM jobs AS active
+                 WHERE active.state IN ('queued', 'running')
+                 AND (active.parent_job_id = terminal.id OR active.retry_of_job_id = terminal.id)
+             )",
+        )
+        .fetch_one(&mut *transaction)
+        .await?
+        .cast_unsigned();
+        transaction.commit().await?;
+        Ok(ClearJobLogsResult {
+            removed_terminal_jobs,
+            removed_job_events,
+            retained_active_jobs,
+            retained_active_job_events,
+            retained_linked_terminal_jobs,
+            retained_linked_terminal_events,
+        })
     }
 
     fn publish(&self, events: impl IntoIterator<Item = JobEvent>) {
@@ -577,6 +672,25 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), StoreError> {
             .await?;
         sqlx::query(
             "INSERT INTO tome_migrations (version, name, applied_at) VALUES (2, 'models', ?)",
+        )
+        .bind(now()?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+    }
+    let applied: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tome_migrations WHERE version = 3")
+        .fetch_one(pool)
+        .await?;
+    if applied == 0 {
+        let mut transaction = pool.begin().await?;
+        sqlx::raw_sql(include_str!(
+            "../migrations/0003_detach_model_download_jobs.sql"
+        ))
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO tome_migrations (version, name, applied_at)
+             VALUES (3, 'detach_model_download_jobs', ?)",
         )
         .bind(now()?)
         .execute(&mut *transaction)
