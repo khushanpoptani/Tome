@@ -28,7 +28,11 @@ import {
   type ServerProfile,
 } from './client-storage';
 import {
+  CLEAR_JOB_LOGS_CONFIRMATION,
   cancelServerJob,
+  clearJobLogs,
+  clearJobLogsErrorMessage,
+  clearJobLogsSummary,
   loadJobs,
   retryServerJob,
   type ServerJob,
@@ -767,6 +771,9 @@ function JobsScreen({
 }) {
   const [jobs, setJobs] = useState<ServerJob[]>([]);
   const [error, setError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [notice, setNotice] = useState('');
+  const [clearing, setClearing] = useState(false);
   const [live, setLive] = useState<'connecting' | 'live' | 'offline'>(
     'connecting',
   );
@@ -828,23 +835,67 @@ function JobsScreen({
     };
   }, [profile, refresh, settings.connection]);
   async function run(operation: () => Promise<unknown>) {
+    setActionError('');
     try {
       await operation();
       await refresh();
     } catch (reason) {
-      setError(String(reason));
+      setActionError(String(reason));
+    }
+  }
+  async function clearLogs() {
+    let confirmed: boolean;
+    try {
+      confirmed = await confirmDialog(CLEAR_JOB_LOGS_CONFIRMATION, {
+        title: 'Clear job logs?',
+        kind: 'warning',
+        okLabel: 'Clear job logs',
+        cancelLabel: 'Cancel',
+      });
+    } catch (reason) {
+      setActionError(clearJobLogsErrorMessage(reason));
+      return;
+    }
+    if (!confirmed) return;
+    setClearing(true);
+    setActionError('');
+    setNotice('');
+    try {
+      const result = await clearJobLogs(profile);
+      await refresh();
+      setNotice(clearJobLogsSummary(result));
+    } catch (reason) {
+      setActionError(clearJobLogsErrorMessage(reason));
+    } finally {
+      setClearing(false);
     }
   }
   return (
     <section className="page-card">
       <PageHeader eyebrow="Stored on connected server" title="Job history">
-        <span className={`live-state ${live}`}>{live}</span>
+        <div className="job-header-actions">
+          <span className={`live-state ${live}`}>{live}</span>
+          <button
+            className="danger-quiet"
+            disabled={clearing}
+            onClick={() => void clearLogs()}
+            type="button"
+          >
+            {clearing ? 'Clearing…' : 'Clear job logs'}
+          </button>
+        </div>
       </PageHeader>
       <p className="intro">
         The server owns durable job execution and replay. Local chats store only
         optional references; server retention is independent.
       </p>
       {error && <p className="error-message">{error}</p>}
+      {actionError && <p className="error-message">{actionError}</p>}
+      {notice && (
+        <p className="success-message" role="status">
+          {notice}
+        </p>
+      )}
       <div className="job-table">
         {jobs.map((job) => (
           <article key={job.id}>

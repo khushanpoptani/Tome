@@ -19,6 +19,18 @@ if ($subsystem -ne 2) {
 }
 
 $installRoot = Join-Path $env:RUNNER_TEMP 'tome-server-installer-smoke'
+$appData = Join-Path $env:LOCALAPPDATA 'com.khushanpoptani.tome-server'
+$dataDirectory = Join-Path $appData 'ci-data'
+New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
+@{
+  port = 17331
+  lan_enabled = $false
+  tailscale_enabled = $false
+  firewall_enabled = $false
+  launch_at_login = $false
+  data_directory = $dataDirectory
+} | ConvertTo-Json | Set-Content (Join-Path $appData 'settings.json') -Encoding UTF8
+
 $install = Start-Process -FilePath $installerFile.FullName -ArgumentList '/S', "/D=$installRoot" -Wait -PassThru
 if ($install.ExitCode -ne 0) {
   throw "Silent installer exited with $($install.ExitCode)"
@@ -27,6 +39,21 @@ if ($install.ExitCode -ne 0) {
 $installedHost = Get-ChildItem $installRoot -Filter 'tome-server-dashboard.exe' -Recurse | Select-Object -First 1
 if (-not $installedHost) {
   throw 'Installed dashboard executable was not found.'
+}
+
+Start-Sleep -Seconds 2
+$installedProcessName = [System.IO.Path]::GetFileNameWithoutExtension($installedHost.Name)
+$autoStarted = @(
+  Get-Process -Name $installedProcessName -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -eq $installedHost.FullName }
+)
+if ($autoStarted.Count -gt 0) {
+  $autoStarted | Stop-Process -Force
+  throw 'Silent install auto-started Tome Server.'
+}
+$unexpectedListener = Get-NetTCPConnection -LocalPort 17331 -State Listen -ErrorAction SilentlyContinue
+if ($unexpectedListener) {
+  throw 'Tome Server test port was listening before the installed app was explicitly started.'
 }
 
 $lanRule = Get-NetFirewallRule -DisplayName 'Tome Server (Private LAN)' -ErrorAction Stop
@@ -43,18 +70,6 @@ $tailscaleAddresses = @($tailscaleFilter.RemoteAddress)
 if ($tailscaleAddresses -notcontains '100.64.0.0-100.127.255.255') {
   throw "Tailscale firewall rule is not scoped to the CGNAT range. Found: $($tailscaleAddresses -join ', ')"
 }
-
-$appData = Join-Path $env:LOCALAPPDATA 'com.khushanpoptani.tome-server'
-$dataDirectory = Join-Path $appData 'ci-data'
-New-Item -ItemType Directory -Path $dataDirectory -Force | Out-Null
-@{
-  port = 17331
-  lan_enabled = $false
-  tailscale_enabled = $false
-  firewall_enabled = $false
-  launch_at_login = $false
-  data_directory = $dataDirectory
-} | ConvertTo-Json | Set-Content (Join-Path $appData 'settings.json') -Encoding UTF8
 
 $hostProcess = Start-Process -FilePath $installedHost.FullName -PassThru
 try {
@@ -95,4 +110,4 @@ if (Get-NetFirewallRule -DisplayName 'Tome Server (Tailscale)' -ErrorAction Sile
   throw 'Tailscale firewall rule remained after uninstall.'
 }
 
-Write-Host "Validated installer $($installerFile.Name), GUI subsystem, health endpoint, firewall scope, and uninstall cleanup."
+Write-Host "Validated installer $($installerFile.Name), silent non-launch, GUI subsystem, health endpoint, firewall scope, and uninstall cleanup."

@@ -185,6 +185,9 @@ select:focus-visible,
   padding: 28px;
 }
 .page-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
   align-items: center;
 }
 .page-header h1 {
@@ -319,6 +322,12 @@ select {
 .job-table {
   display: grid;
   gap: 10px;
+}
+.job-header-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
 }
 .job-table article {
   display: grid;
